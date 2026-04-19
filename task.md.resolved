@@ -1,0 +1,61 @@
+# AMLIC Project — Task Tracker
+
+## Phase 0: Repo Scaffolding
+- [x] Create project structure (dirs, pyproject.toml, .gitignore, .env.example)
+- [x] Write README with architecture diagram
+- [x] Create VM bootstrap script (`infra/vm_bootstrap.sh`)
+- [x] Create vLLM start scripts (collocated, prefill, decode)
+- [x] Create disaggregated proxy server (`infra/proxy_server.py`)
+- [x] Create benchmark client (`benchmark/client.py`)
+- [x] Create workload profiles (`benchmark/workloads.py`)
+- [x] Create benchmark runner (`benchmark/runner.py`)
+- [x] Create prompt source text (`benchmark/prompts/pg_essays.txt`)
+- [x] Create threshold calculator (`analysis/compute_threshold.py`)
+- [x] Create plot generator (`analysis/plot_results.py`)
+- [x] Create adaptive router (`router/router.py`)
+- [x] Create Streamlit demo (`demo/app.py`)
+- [x] Create helper scripts (health check, net benchmark, full benchmark)
+
+## Phase 1: Environment Setup (Next — needs user input)
+- [ ] User provides VM IPs, SSH keys, GPU confirmation
+- [ ] Copy .env.example to .env and fill in values
+- [ ] SSH into both VMs and run `vm_bootstrap.sh`
+- [ ] Install Tailscale on both VMs
+- [ ] Run `scripts/net_benchmark.sh` to measure network baseline
+- [ ] Confirm Tailscale IPs and update .env
+
+## Phase 2: Networking + UCX Verification
+- [ ] Verify Tailscale connectivity between VMs
+- [ ] Confirm UCX_NET_DEVICES interface name (tailscale0 vs ts0)
+- [ ] Run iperf3 bandwidth test over Tailscale
+- [ ] Document RTT and bandwidth in results
+
+## Phase 3: vLLM Serving
+- [ ] Start collocated vLLM on L4 VM — verify with curl
+- [ ] Start prefill engine on L4 VM
+- [ ] Start decode engine on T4 VM
+- [ ] Start proxy server
+- [ ] Send test request through proxy — verify KV transfer works
+- [ ] Pin vLLM version once stable
+
+## Phase 4: Benchmarking
+- [ ] Run collocated benchmarks (all profiles + sweep)
+- [ ] Run disaggregated benchmarks (all profiles + sweep)
+- [ ] Verify CSV outputs are correct
+
+## Phase 5: Analysis
+- [ ] Compute crossover threshold N
+- [ ] Generate plots (crossover, profile comparison, ITL distribution)
+- [ ] Update .env with ROUTING_THRESHOLD
+- [ ] Cost analysis ($/request at various token counts)
+
+## Phase 6: Router + Demo
+- [ ] Start adaptive router on laptop
+- [ ] Verify routing logic with test requests
+- [ ] Launch Streamlit demo
+- [ ] Demo: compare mode (side-by-side latency)
+
+## Phase 7: Documentation + Submission
+- [ ] Write project report
+- [ ] Clean up and push to GitHub
+- [ ] Record demo video
