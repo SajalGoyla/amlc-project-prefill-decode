@@ -31,5 +31,4 @@ vllm serve "$MODEL" \
     --host 0.0.0.0 \
     --port "$PORT" \
     --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --disable-log-requests
+    --gpu-memory-utilization "$GPU_MEM_UTIL"

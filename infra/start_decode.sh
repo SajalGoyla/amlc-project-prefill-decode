@@ -49,5 +49,4 @@ vllm serve "$MODEL" \
     --port "$PORT" \
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --kv-transfer-config "$KV_TRANSFER_CONFIG" \
-    --disable-log-requests
+    --kv-transfer-config "$KV_TRANSFER_CONFIG"

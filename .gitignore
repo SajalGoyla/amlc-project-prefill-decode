@@ -49,3 +49,6 @@ logs/
 # Secrets
 *.pem
 *.key
+
+# Claude Code transient files
+.claude/
