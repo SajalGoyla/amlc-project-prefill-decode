@@ -166,23 +166,22 @@ def reconstruct_past_key_values(session_id: str, num_layers: int):
     # In newer Transformers (e.g. Llama 3), DynamicCache is required instead of raw tuples.
     try:
         from transformers.cache_utils import DynamicCache
-        past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        cache = DynamicCache()
+        for layer_idx, (k, v) in enumerate(past_key_values):
+            cache.update(k, v, layer_idx)
+            
+        # Swap tuple for the DynamicCache object
+        past_key_values = cache
         logger.info(
-            "Reconstructed DynamicCache for session '%s': %d layers, "
-            "key shape=%s, value shape=%s",
+            "Reconstructed DynamicCache for session '%s': %d layers (format manually built).",
             session_id,
             num_layers,
-            list(past_key_values.key_cache[0].shape),
-            list(past_key_values.value_cache[0].shape),
         )
-    except ImportError:
+    except Exception as e:
         logger.info(
-            "Reconstructed past_key_values (legacy tuple) for session '%s': %d layers, "
-            "key shape=%s, value shape=%s",
+            "Could not build DynamicCache (using legacy tuple fallback) for session '%s': %s",
             session_id,
-            num_layers,
-            list(past_key_values[0][0].shape),
-            list(past_key_values[0][1].shape),
+            e
         )
 
     return past_key_values
@@ -195,7 +194,7 @@ def reconstruct_past_key_values(session_id: str, num_layers: int):
 
 def run_decode(
     session_id: str,
-    past_key_values: tuple,
+    past_key_values,
     last_token_id: int,
     max_new_tokens: int,
     num_prompt_tokens: int,
