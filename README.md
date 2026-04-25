@@ -1,179 +1,191 @@
-# AMLIC — Adaptive Multi-tier LLM Inference on Cloud
+# Disaggregated LLM Serving: Prefill-Decode Splitting over ZMQ
 
-> Columbia COMS 6998 (Cloud Computing) — Final Project
+A distributed LLM inference system that disaggregates the **Prefill** and **Decode** phases across two separate GCP instances connected via VPC Peering and ZeroMQ.
 
-**Adaptive LLM Inference via Prefill/Decode Disaggregation on Heterogeneous GPUs**
-
-## Overview
-
-This project benchmarks **collocated** vs **disaggregated** (prefill/decode) LLM serving using [vLLM](https://github.com/vllm-project/vllm) with the [NIXL](https://github.com/ai-dynamo/nixl) connector over a Tailscale overlay network. The goal is to find the empirical **prompt-length crossover threshold N**, below which collocated serving is faster and above which disaggregated serving wins.
-
-### Architecture
+## Architecture
 
 ```
-┌─────────────────┐         ┌──────────────────────────────────┐
-│   User / Demo   │         │         Adaptive Router          │
-│   (Streamlit)   │────────▶│  token_count ≥ N? → disagg      │
-│                 │         │  token_count < N? → collocated   │
-└─────────────────┘         └──────────┬───────────┬───────────┘
-                                       │           │
-                            ┌──────────▼──┐   ┌────▼───────────────────────┐
-                            │ Collocated  │   │   Disaggregated Proxy     │
-                            │  vLLM (L4)  │   │   (FastAPI)               │
-                            │  Port 8000  │   │   Port 9000               │
-                            └─────────────┘   └────┬──────────┬───────────┘
-                                                   │          │
-                                          ┌────────▼──┐  ┌────▼────────┐
-                                          │  Prefill  │  │   Decode    │
-                                          │ vLLM (L4) │  │  vLLM (T4) │
-                                          │ Port 8100 │──│  Port 8200  │
-                                          │ KV Prod.  │  │  KV Cons.  │
-                                          └───────────┘  └────────────┘
-                                              NIXL/UCX over Tailscale
+┌──────────┐     HTTP      ┌─────────────────┐     ZMQ PUSH/PULL      ┌─────────────────┐
+│  Client  │──────────────▶│  API Gateway    │                        │                 │
+│          │               │  (gateway.py)   │──────HTTP──────────────▶│  Prefill Worker │
+└──────────┘               └─────────────────┘                        │  (prefill_      │
+                                                                      │   worker.py)    │
+                                                                      └────────┬────────┘
+                                                                               │
+                                                                    ZMQ (TCP)  │  KV-cache
+                                                                    layer-by-  │  streaming
+                                                                    layer      │
+                                                                               ▼
+                           ┌─────────────────┐                        ┌─────────────────┐
+                           │  Benchmark      │                        │  Decode Worker  │
+                           │  (benchmark.py) │                        │  (decode_       │
+                           └─────────────────┘                        │   worker.py)    │
+                                                                      └─────────────────┘
 ```
 
-### Hardware
+### How It Works
 
-| Role | GPU | VRAM | VM Type | 
-|------|-----|------|---------|
-| Prefill + Collocated | NVIDIA L4 | 24 GB | GCP g2-standard-4 |
-| Decode | NVIDIA T4 | 16 GB | GCP n1-standard-4 + T4 |
+1. **Client** sends a prompt to the **API Gateway**.
+2. **Gateway** forwards the request to the **Prefill Worker** (fire-and-forget) and returns `200 OK` immediately.
+3. **Prefill Worker** runs the forward pass through LLaMA-3-8B-Instruct. Using `register_forward_hook`, it **streams KV-cache tensors layer-by-layer** over a ZMQ PUSH socket as soon as each layer completes — no waiting for the full forward pass.
+4. **Decode Worker** listens on a ZMQ PULL socket, buffers incoming layer tensors, and upon receiving the `PREFILL_COMPLETE` signal, reconstructs `past_key_values` and runs `model.generate()` to produce output tokens.
 
-### Model
+### Why ZMQ?
 
-- `meta-llama/Llama-3.2-3B-Instruct` (3B params, fits in 16 GB with room for KV cache)
+The two GCP instances live in **different GCP projects** under a university workspace. Standard GPU interconnects (NVLink, NVSwitch) and NCCL are not available across projects. VPC Peering provides L3 routing, and ZMQ provides a lightweight, high-performance async messaging layer over TCP.
 
 ## Repository Structure
 
 ```
-Project/
-├── .env.example           # Environment template
-├── pyproject.toml         # Python project config
-├── README.md              # This file
-│
-├── infra/                 # VM infrastructure scripts
-│   ├── vm_bootstrap.sh    # Idempotent VM setup
-│   ├── start_collocated.sh
-│   ├── start_prefill.sh
-│   ├── start_decode.sh
-│   └── proxy_server.py    # Disaggregated proxy
-│
-├── benchmark/             # Benchmarking framework
-│   ├── client.py          # Async OpenAI-compatible client
-│   ├── workloads.py       # Workload profiles + sweep
-│   ├── runner.py          # Benchmark orchestrator
-│   ├── prompts/           # Source text for prompt generation
-│   └── results/           # CSV results (gitignored, except .gitkeep)
-│
-├── analysis/              # Data analysis
-│   ├── compute_threshold.py  # Find crossover N
-│   ├── plot_results.py    # Generate plots
-│   └── figures/           # Output plots
-│
-├── router/                # Adaptive router
-│   └── router.py          # FastAPI router
-│
-├── demo/                  # Streamlit demo
-│   └── app.py             # Interactive chatbot + comparison
-│
-└── scripts/               # Helper scripts
-    ├── run_full_benchmark.sh
-    ├── health_check.sh
-    └── net_benchmark.sh
+.
+├── infra/
+│   └── setup_gcp.sh           # Phase 1: GCP infrastructure provisioning
+├── app/
+│   ├── gateway.py              # Phase 2A: FastAPI API Gateway
+│   ├── prefill_worker.py       # Phase 2B: Prefill Worker with hook-based KV streaming
+│   └── decode_worker.py        # Phase 2C: Decode Worker with KV cache reconstruction
+├── benchmark/
+│   └── benchmark.py            # Phase 3: End-to-end benchmarking script
+├── requirements.txt            # Python dependencies
+├── .env.example                # Environment variable template
+├── .gitignore
+├── Project Proposal.pdf
+└── README.md
 ```
+
+## Prerequisites
+
+- Two GCP projects with GPU quota for `g2-standard-4` (NVIDIA L4)
+- `gcloud` CLI authenticated for both projects
+- Python 3.10+
+- A HuggingFace token with access to `meta-llama/Meta-Llama-3-8B-Instruct`
 
 ## Quick Start
 
-### 1. Setup (Laptop)
+### 1. Provision GCP Infrastructure
 
 ```bash
-# Clone and install local dependencies
-cd Project/
+# Edit variables at the top of the script
+vim infra/setup_gcp.sh
+
+# Run the setup
+chmod +x infra/setup_gcp.sh
+bash infra/setup_gcp.sh
+```
+
+### 2. Deploy to VMs
+
+SSH into each VM and clone the repo:
+
+```bash
+# On BOTH VMs:
+gcloud compute ssh <vm-name> --project=<project-id> --zone=<zone>
+
+git clone <your-repo-url> ~/project && cd ~/project
+pip install -r requirements.txt
+
+# Set environment variables
 cp .env.example .env
-# Edit .env with your HF_TOKEN, VM IPs, etc.
-
-pip install -e ".[dev]"
+vim .env  # Fill in HF_TOKEN, DECODE_WORKER_IP, etc.
 ```
 
-### 2. Setup (VMs)
+### 3. Start the Services (in order)
 
 ```bash
-# On each VM:
-scp -r infra/ user@VM_IP:~/amlic/
-ssh user@VM_IP
-cd ~/amlic
-bash infra/vm_bootstrap.sh
+# Terminal 1 — Decode Worker (start FIRST, it listens for connections)
+# On the DECODE VM:
+python app/decode_worker.py
+
+# Terminal 2 — Prefill Worker
+# On the PREFILL VM:
+python app/prefill_worker.py
+
+# Terminal 3 — API Gateway (can run on either VM or locally)
+python app/gateway.py
 ```
 
-### 3. Install Tailscale (both VMs)
+### 4. Test It
 
 ```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-# Note the Tailscale IPs and update .env
+# From any machine with network access to the Gateway:
+python benchmark/benchmark.py
 ```
 
-### 4. Start Services
+## Environment Variables
+
+| Variable | Description | Example |
+|---|---|---|
+| `HF_TOKEN` | HuggingFace access token | `hf_abc123...` |
+| `PREFILL_WORKER_HOST` | IP/hostname of the Prefill VM | `10.128.0.2` |
+| `PREFILL_WORKER_PORT` | Port for Prefill FastAPI server | `8001` |
+| `DECODE_WORKER_HOST` | IP/hostname of the Decode VM | `10.128.0.3` |
+| `DECODE_WORKER_PORT` | Port for Decode FastAPI server | `8002` |
+| `ZMQ_PORT` | Port for ZMQ KV-cache streaming | `5555` |
+| `GATEWAY_HOST` | IP/hostname for the API Gateway | `0.0.0.0` |
+| `GATEWAY_PORT` | Port for Gateway FastAPI server | `8000` |
+
+## End-to-End Testing Guide
+
+See the detailed walkthrough below for step-by-step instructions.
+
+### Step 1: Verify Network Connectivity
 
 ```bash
-# ON PREFILL VM (L4):
-bash infra/start_collocated.sh   # Collocated baseline
-bash infra/start_prefill.sh      # Prefill engine (in another tmux)
-python infra/proxy_server.py \
-    --prefiller-host $(tailscale ip -4) --prefiller-port 8100 \
-    --decoder-host <DECODE_TAILSCALE_IP> --decoder-port 8200
+# From Prefill VM, ping Decode VM internal IP:
+ping <DECODE_INTERNAL_IP>
 
-# ON DECODE VM (T4):
-bash infra/start_decode.sh
+# From Decode VM, ping Prefill VM internal IP:
+ping <PREFILL_INTERNAL_IP>
+
+# Test ZMQ port is reachable (from Prefill VM):
+nc -zv <DECODE_INTERNAL_IP> 5555
 ```
 
-### 5. Run Benchmarks
+### Step 2: Smoke Test (without GPU)
+
+You can run a quick connectivity test without loading models:
 
 ```bash
-# ON LAPTOP:
-bash scripts/run_full_benchmark.sh 30 1
-# Or run individual profiles:
-python -m benchmark.runner --endpoint http://<IP>:8000/v1 --arch collocated --profile chat
+# On Decode VM — start in test mode
+python app/decode_worker.py --test-zmq
+
+# On Prefill VM — send a test message
+python -c "import zmq; ctx=zmq.Context(); s=ctx.socket(zmq.PUSH); s.connect('tcp://<DECODE_IP>:5555'); s.send_string('hello'); print('sent')"
 ```
 
-### 6. Analyze Results
+### Step 3: Full End-to-End Run
 
 ```bash
-python -m analysis.compute_threshold --results-dir benchmark/results/
-python -m analysis.plot_results --results-dir benchmark/results/
+# 1. Start Decode Worker (on Decode VM)
+python app/decode_worker.py
+
+# 2. Start Prefill Worker (on Prefill VM)
+python app/prefill_worker.py
+
+# 3. Start Gateway (on Prefill VM or separate machine)
+python app/gateway.py
+
+# 4. Run benchmark (from any machine)
+python benchmark/benchmark.py --gateway-url http://<GATEWAY_IP>:8000
 ```
 
-### 7. Launch Demo
+### Step 4: Interpret Results
 
-```bash
-streamlit run demo/app.py
-```
+The benchmark script will print:
+- **TTFT (Time To First Token)**: Latency from request submission to first token generation
+- **TPOT (Time Per Output Token)**: Average latency per generated token
+- **Total E2E Latency**: Full round-trip time
+- **Tokens Generated**: Number of output tokens
 
-## Key Metrics
+## Troubleshooting
 
-| Metric | Description |
-|--------|-------------|
-| **TTFT** | Time to first token (ms) — user-perceived responsiveness |
-| **ITL** | Inter-token latency (ms) — streaming smoothness |
-| **Throughput** | Output tokens per second |
-| **Total Latency** | End-to-end request latency (ms) |
-
-## Workload Profiles
-
-| Profile | Input Tokens | Output Tokens | Use Case |
-|---------|-------------|---------------|----------|
-| `chat` | 50 | 500 | Short prompt, long generation |
-| `doc_qa` | 2000 | 100 | Long document, short answer |
-| `balanced` | 500 | 200 | Medium both |
-| `sweep_N` | Variable | 100 | Prompt-length sweep for threshold |
-
-## Fallback Plan
-
-If NIXL/UCX over Tailscale proves unstable:
-1. Switch to **LMCacheConnector** (uses Redis for KV transfer)
-2. Install Redis on both VMs
-3. Update `kv_connector` in start scripts
+| Issue | Solution |
+|---|---|
+| VPC Peering blocked | Check GCP org policies; request IT override for `constraints/compute.restrictVpcPeering` |
+| ZMQ connection timeout | Verify firewall rules allow TCP on port 5555; check VPC peering status |
+| CUDA OOM | Reduce `max_new_tokens` or use `torch.float16` (already default) |
+| HuggingFace gated model | Ensure `HF_TOKEN` has accepted the LLaMA-3 license agreement |
 
 ## License
 
-Academic project — Columbia University COMS 6998.
+Academic use — Columbia University COMS 6998 (AMLC) course project.
