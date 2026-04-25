@@ -286,14 +286,21 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
         raise RuntimeError("Model did not return past_key_values")
 
     # Handle DynamicCache (newer transformers) vs raw tuple
-    if hasattr(past_kv, 'key_cache') and hasattr(past_kv, 'value_cache'):
-        # DynamicCache object
-        num_layers = len(past_kv.key_cache)
+    past_kv_type = type(past_kv).__name__
+    
+    if past_kv_type == "DynamicCache" or hasattr(past_kv, "key_cache"):
+        # DynamicCache object from transformers.cache_utils
+        num_layers = len(past_kv) if hasattr(past_kv, "__len__") else len(past_kv.key_cache)
         logger.info("Extracted DynamicCache with %d layers", num_layers)
-        kv_pairs = [
-            (past_kv.key_cache[i], past_kv.value_cache[i])
-            for i in range(num_layers)
-        ]
+        
+        # Some versions expose key_cache directly, others implement __getitem__
+        if hasattr(past_kv, "__getitem__"):
+            kv_pairs = [past_kv[i] for i in range(num_layers)]
+        else:
+            kv_pairs = [
+                (past_kv.key_cache[i], past_kv.value_cache[i])
+                for i in range(num_layers)
+            ]
     elif isinstance(past_kv, (tuple, list)):
         # Traditional tuple of tuples
         num_layers = len(past_kv)
