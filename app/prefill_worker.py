@@ -309,7 +309,10 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
 
     t_stream_start = time.perf_counter()
 
-    for layer_idx, (key_tensor, value_tensor) in enumerate(kv_pairs):
+    for layer_idx, layer_data in enumerate(kv_pairs):
+        key_tensor = layer_data[0]
+        value_tensor = layer_data[1]
+        
         t = threading.Thread(
             target=_send_kv_layer,
             args=(
