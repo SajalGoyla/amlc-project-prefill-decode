@@ -263,6 +263,14 @@ def run_decode(
     logger.info("TPOT: %.2f ms/token", tpot_ms)
     logger.info("Output: %s", generated_text[:200] + ("..." if len(generated_text) > 200 else ""))
     logger.info("=" * 60)
+    
+    # Store metrics for benchmark comparisons securely
+    metrics_store[session_id] = {
+        "status":"complete",
+        "tpot_ms": round(tpot_ms, 2),
+        "decode_time_ms": round(decode_time_ms, 2),
+        "tokens": num_generated
+    }
 
     return {
         "session_id": session_id,
@@ -274,8 +282,33 @@ def run_decode(
 
 
 # ==============================================================================
+# Background API Server for Metrics
+# ==============================================================================
+
+from fastapi import FastAPI, HTTPException
+import uvicorn
+import threading
+
+# Metrics store: { session_id: { tpot_ms, tokens, decode_time_ms } }
+metrics_store = {}
+
+app = FastAPI(title="Decode Worker Metrics API")
+
+@app.get("/metrics/{session_id}")
+async def get_metrics(session_id: str):
+    if session_id not in metrics_store:
+        raise HTTPException(status_code=404, detail="Session metrics not available")
+    return metrics_store[session_id]
+
+def run_metrics_api():
+    """Run the metrics FastAPI server in a background thread."""
+    uvicorn.run(app, host=DECODE_HOST, port=DECODE_PORT, log_level="error")
+
+
+# ==============================================================================
 # ZMQ Listener Loop
 # ==============================================================================
+
 
 
 def run_zmq_listener(test_mode: bool = False):
@@ -467,6 +500,11 @@ def main():
 
     if not args.test_zmq:
         load_model()
+        
+        # Start background metrics API server
+        api_t = threading.Thread(target=run_metrics_api, daemon=True)
+        api_t.start()
+        logger.info("Background REST API thread started on port %d", DECODE_PORT)
 
     run_zmq_listener(test_mode=args.test_zmq)
 
