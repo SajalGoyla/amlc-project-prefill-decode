@@ -285,30 +285,14 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
         logger.error("No past_key_values in model output! use_cache may not be working.")
         raise RuntimeError("Model did not return past_key_values")
 
-    # Handle DynamicCache (newer transformers) vs raw tuple
-    past_kv_type = type(past_kv).__name__
-    
-    if past_kv_type == "DynamicCache" or hasattr(past_kv, "key_cache"):
-        # DynamicCache object from transformers.cache_utils
-        num_layers = len(past_kv) if hasattr(past_kv, "__len__") else len(past_kv.key_cache)
-        logger.info("Extracted DynamicCache with %d layers", num_layers)
-        
-        # Some versions expose key_cache directly, others implement __getitem__
-        if hasattr(past_kv, "__getitem__"):
-            kv_pairs = [past_kv[i] for i in range(num_layers)]
-        else:
-            kv_pairs = [
-                (past_kv.key_cache[i], past_kv.value_cache[i])
-                for i in range(num_layers)
-            ]
-    elif isinstance(past_kv, (tuple, list)):
-        # Traditional tuple of tuples
-        num_layers = len(past_kv)
-        logger.info("Extracted tuple past_key_values with %d layers", num_layers)
-        kv_pairs = [(layer_kv[0], layer_kv[1]) for layer_kv in past_kv]
-    else:
-        logger.error("Unknown past_key_values type: %s", type(past_kv))
-        raise RuntimeError(f"Unknown past_key_values type: {type(past_kv)}")
+    # Extract KV cache — works for both legacy tuple-of-tuples and new DynamicCache
+    try:
+        kv_pairs = list(past_kv)
+        num_layers = len(kv_pairs)
+        logger.info("Extracted past_key_values (type: %s) with %d layers", type(past_kv).__name__, num_layers)
+    except Exception as e:
+        logger.error("Failed to parse past_key_values of type %s: %s", type(past_kv), e)
+        raise RuntimeError(f"Unknown past_key_values format: {type(past_kv)}")
 
     logger.info(
         "KV cache shape per layer: key=%s, value=%s",
