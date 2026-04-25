@@ -160,17 +160,30 @@ def reconstruct_past_key_values(session_id: str, num_layers: int):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    # Convert to tuple of tuples (required by HuggingFace)
+    # Convert to tuple of tuples (legacy format)
     past_key_values = tuple(past_key_values)
-
-    logger.info(
-        "Reconstructed past_key_values for session '%s': %d layers, "
-        "key shape=%s, value shape=%s",
-        session_id,
-        num_layers,
-        list(past_key_values[0][0].shape),
-        list(past_key_values[0][1].shape),
-    )
+    
+    # In newer Transformers (e.g. Llama 3), DynamicCache is required instead of raw tuples.
+    try:
+        from transformers.cache_utils import DynamicCache
+        past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        logger.info(
+            "Reconstructed DynamicCache for session '%s': %d layers, "
+            "key shape=%s, value shape=%s",
+            session_id,
+            num_layers,
+            list(past_key_values.key_cache[0].shape),
+            list(past_key_values.value_cache[0].shape),
+        )
+    except ImportError:
+        logger.info(
+            "Reconstructed past_key_values (legacy tuple) for session '%s': %d layers, "
+            "key shape=%s, value shape=%s",
+            session_id,
+            num_layers,
+            list(past_key_values[0][0].shape),
+            list(past_key_values[0][1].shape),
+        )
 
     return past_key_values
 

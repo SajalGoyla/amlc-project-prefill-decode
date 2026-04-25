@@ -3,15 +3,13 @@ Phase 2B: Prefill Worker
 ========================
 FastAPI server that receives prompts from the Gateway, runs the LLM forward
 pass, and streams KV-cache tensors layer-by-layer to the Decode Worker over
-ZMQ using PyTorch register_forward_hook.
+ZMQ.
 
 Key Design:
-    - Each transformer layer has a forward hook attached.
-    - The hook captures the K and V tensors from that layer's output.
-    - A background thread moves tensors to CPU (non-blocking) and sends
-      them over a ZMQ PUSH socket — this happens DURING the forward pass,
-      not after it.
-    - After the full forward pass completes, a PREFILL_COMPLETE signal is sent.
+    - Run the forward pass with use_cache=True.
+    - Extract past_key_values from the model output (all layers at once).
+    - Stream each layer's K/V tensors over ZMQ in background threads.
+    - Send PREFILL_COMPLETE signal when all layers are queued.
 
 Endpoints:
     POST /prefill  — Receive a prompt and run prefill
@@ -143,70 +141,8 @@ def setup_zmq():
 
 
 # ==============================================================================
-# KV-Cache Streaming via Forward Hooks
+# KV-Cache Streaming (post forward pass)
 # ==============================================================================
-
-
-def create_kv_hook(layer_idx: int, session_id: str, zmq_sock, send_lock: threading.Lock):
-    """
-    Create a forward hook for a specific transformer layer.
-
-    The hook intercepts the layer's output, extracts Key and Value tensors
-    from the attention module's cache, and spawns a background thread to
-    serialize and send them over ZMQ.
-    """
-
-    def hook_fn(module, input, output):
-        """
-        Forward hook callback.
-
-        For LLaMA-3 models, the output of each decoder layer is a tuple:
-          (hidden_states, present_key_value)
-        where present_key_value is a tuple (key_tensor, value_tensor).
-        """
-        try:
-            # output is typically (hidden_states, ) or (hidden_states, present_kv, ...)
-            # When use_cache=True, present_key_value is available
-            if isinstance(output, tuple) and len(output) >= 2:
-                present_kv = output[1]
-
-                if present_kv is not None and isinstance(present_kv, tuple) and len(present_kv) == 2:
-                    key_tensor = present_kv[0]
-                    value_tensor = present_kv[1]
-
-                    # Spawn a background thread for async CPU transfer + ZMQ send
-                    t = threading.Thread(
-                        target=_send_kv_layer,
-                        args=(
-                            layer_idx,
-                            session_id,
-                            key_tensor,
-                            value_tensor,
-                            zmq_sock,
-                            send_lock,
-                        ),
-                        daemon=True,
-                    )
-                    t.start()
-                else:
-                    logger.warning(
-                        "Layer %d: present_kv is None or unexpected format. "
-                        "Type: %s",
-                        layer_idx,
-                        type(present_kv),
-                    )
-            else:
-                logger.warning(
-                    "Layer %d: output has unexpected structure. len=%s, type=%s",
-                    layer_idx,
-                    len(output) if isinstance(output, tuple) else "N/A",
-                    type(output),
-                )
-
-        except Exception as e:
-            logger.error("Hook error at layer %d: %s", layer_idx, e, exc_info=True)
-
-    return hook_fn
 
 
 def _send_kv_layer(
@@ -249,10 +185,11 @@ def _send_kv_layer(
             zmq_sock.send(data, flags=zmq.NOBLOCK)
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000
-        logger.debug(
-            "Sent KV layer %d for session '%s' "
-            "(key=%s, value=%s, payload=%.1f KB, time=%.1f ms)",
+        logger.info(
+            "Sent KV layer %d/%d for session '%s' "
+            "(key=%s, value=%s, %.1f KB, %.1f ms)",
             layer_idx,
+            31,  # 0-indexed, total will be logged at the end
             session_id,
             list(key_cpu.shape),
             list(value_cpu.shape),
@@ -285,10 +222,10 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
     """
     Execute the prefill phase:
       1. Tokenize the prompt.
-      2. Attach forward hooks to every transformer layer.
-      3. Run the forward pass with use_cache=True.
-      4. Send PREFILL_COMPLETE signal.
-      5. Clean up hooks.
+      2. Run the forward pass with use_cache=True.
+      3. Extract past_key_values from model output.
+      4. Stream each layer's K/V tensors over ZMQ.
+      5. Send PREFILL_COMPLETE signal.
 
     Returns a summary dict with timing information.
     """
@@ -317,21 +254,7 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
         list(input_ids.shape),
     )
 
-    # Thread-safe lock for ZMQ sends
-    send_lock = threading.Lock()
-
-    # Register forward hooks on every transformer layer
-    hooks = []
-    num_layers = len(model.model.layers)
-    for layer_idx, layer in enumerate(model.model.layers):
-        hook = layer.register_forward_hook(
-            create_kv_hook(layer_idx, session_id, zmq_socket, send_lock)
-        )
-        hooks.append(hook)
-
-    logger.info("Registered %d forward hooks.", len(hooks))
-
-    # Run the forward pass
+    # Run the forward pass — this is the actual prefill computation
     t_forward_start = time.perf_counter()
     try:
         with torch.no_grad():
@@ -342,21 +265,89 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
             )
     except Exception as e:
         logger.error("Forward pass failed for session '%s': %s", session_id, e)
-        # Clean up hooks even on failure
-        for h in hooks:
-            h.remove()
         raise
 
     t_forward_end = time.perf_counter()
     forward_time_ms = (t_forward_end - t_forward_start) * 1000
 
-    # Clean up hooks
-    for h in hooks:
-        h.remove()
-    logger.info("Removed %d forward hooks.", len(hooks))
+    # =========================================================================
+    # Extract past_key_values from model output
+    # =========================================================================
+    # In HuggingFace Transformers, outputs.past_key_values is either:
+    #   - A tuple of tuples: ((k0, v0), (k1, v1), ..., (kN, vN))
+    #   - A DynamicCache object (newer versions) with .key_cache / .value_cache
+    # We handle both cases.
+    # =========================================================================
 
-    # Allow background threads a moment to finish sending
-    time.sleep(0.5)
+    past_kv = outputs.past_key_values
+    
+    if past_kv is None:
+        logger.error("No past_key_values in model output! use_cache may not be working.")
+        raise RuntimeError("Model did not return past_key_values")
+
+    # Handle DynamicCache (newer transformers) vs raw tuple
+    if hasattr(past_kv, 'key_cache') and hasattr(past_kv, 'value_cache'):
+        # DynamicCache object
+        num_layers = len(past_kv.key_cache)
+        logger.info("Extracted DynamicCache with %d layers", num_layers)
+        kv_pairs = [
+            (past_kv.key_cache[i], past_kv.value_cache[i])
+            for i in range(num_layers)
+        ]
+    elif isinstance(past_kv, (tuple, list)):
+        # Traditional tuple of tuples
+        num_layers = len(past_kv)
+        logger.info("Extracted tuple past_key_values with %d layers", num_layers)
+        kv_pairs = [(layer_kv[0], layer_kv[1]) for layer_kv in past_kv]
+    else:
+        logger.error("Unknown past_key_values type: %s", type(past_kv))
+        raise RuntimeError(f"Unknown past_key_values type: {type(past_kv)}")
+
+    logger.info(
+        "KV cache shape per layer: key=%s, value=%s",
+        list(kv_pairs[0][0].shape),
+        list(kv_pairs[0][1].shape),
+    )
+
+    # =========================================================================
+    # Stream KV layers over ZMQ (in background threads for parallelism)
+    # =========================================================================
+
+    send_lock = threading.Lock()
+    threads = []
+
+    t_stream_start = time.perf_counter()
+
+    for layer_idx, (key_tensor, value_tensor) in enumerate(kv_pairs):
+        t = threading.Thread(
+            target=_send_kv_layer,
+            args=(
+                layer_idx,
+                session_id,
+                key_tensor,
+                value_tensor,
+                zmq_socket,
+                send_lock,
+            ),
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+
+    # Wait for all send threads to complete
+    for t in threads:
+        t.join(timeout=30.0)
+        if t.is_alive():
+            logger.warning("Send thread still alive after 30s timeout")
+
+    t_stream_end = time.perf_counter()
+    stream_time_ms = (t_stream_end - t_stream_start) * 1000
+
+    logger.info(
+        "All %d KV layers sent over ZMQ in %.1f ms",
+        num_layers,
+        stream_time_ms,
+    )
 
     # Send PREFILL_COMPLETE signal
     complete_payload = {
@@ -373,12 +364,17 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
     with send_lock:
         zmq_socket.send(complete_data)
 
+    total_time_ms = forward_time_ms + stream_time_ms
+
     logger.info(
-        "Prefill complete for session '%s': %d layers, %.1f ms forward pass, "
+        "Prefill complete for session '%s': %d layers, "
+        "forward=%.1f ms, stream=%.1f ms, total=%.1f ms, "
         "%d prompt tokens.",
         session_id,
         num_layers,
         forward_time_ms,
+        stream_time_ms,
+        total_time_ms,
         input_ids.shape[1],
     )
 
@@ -386,7 +382,7 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
         "session_id": session_id,
         "status": "prefill_complete",
         "num_layers_streamed": num_layers,
-        "prefill_time_ms": round(forward_time_ms, 2),
+        "prefill_time_ms": round(total_time_ms, 2),
     }
 
 
