@@ -117,14 +117,18 @@ async def run_suite(args):
             print("Collocated Test Finished.")
 
         # 2. Disaggregated Test
-        print(f"\\n--- Running DISAGGREGATED Baseline ({args.gateway_url}) ---")
-        tasks = []
-        for i in range(args.concurrent):
-            await asyncio.sleep(0.1)
-            tasks.append(asyncio.create_task(benchmark_disaggregated(session, args.gateway_url, args.decode_url, i, args.max_tokens)))
-        
-        disag_results = [r for r in await asyncio.gather(*tasks) if r]
-        print("Disaggregated Test Finished.\\n")
+        if args.skip_disaggregated:
+            print("\nSkipping Disaggregated Test...")
+            disag_results = []
+        else:
+            print(f"\n--- Running DISAGGREGATED Baseline ({args.gateway_url}) ---")
+            tasks = []
+            for i in range(args.concurrent):
+                await asyncio.sleep(0.1)
+                tasks.append(asyncio.create_task(benchmark_disaggregated(session, args.gateway_url, args.decode_url, i, args.max_tokens)))
+            
+            disag_results = [r for r in await asyncio.gather(*tasks) if r]
+            print("Disaggregated Test Finished.\n")
         
     # Generate Output
     print("=" * 60)
@@ -133,20 +137,24 @@ async def run_suite(args):
     
     def print_stats(name, results):
         if not results:
+            print(f"\n## {name} Metrics")
+            print("  [Skipped or Failed]")
             return
         ttft = [r["ttft_ms"] for r in results]
         tpot = [r["tpot_ms"] for r in results]
         e2e = [r["e2e_lat"] for r in results]
-        print(f"\\n## {name} Metrics (Concurrent Load: {args.concurrent})")
+        print(f"\n## {name} Metrics (Concurrent Load: {args.concurrent})")
         print(f"  Avg TTFT (Time-To-First-Token) : {np.mean(ttft):.1f} ms")
         print(f"  Avg TPOT (Time-Per-Output)     : {np.mean(tpot):.1f} ms")
         print(f"  Total Batch Generation Time    : {np.max(e2e)/1000.0:.2f} seconds")
         print(f"  Cumulative System Throughput   : {sum([r['tokens'] for r in results]) / (np.max(e2e)/1000.0):.1f} tokens/sec")
 
-    print_stats("COLLOCATED (Single GPU)", coloc_results)
     if not args.skip_collocated:
-        print("\\n  VS\\n")
-    print_stats("DISAGGREGATED (Dual GPU ZMQ Tunnel)", disag_results)
+        print_stats("COLLOCATED (Single GPU)", coloc_results)
+    if not args.skip_collocated and not args.skip_disaggregated:
+        print("\n  VS\n")
+    if not args.skip_disaggregated:
+        print_stats("DISAGGREGATED (Dual GPU ZMQ Tunnel)", disag_results)
     print("=" * 60)
 
 if __name__ == "__main__":
@@ -157,5 +165,6 @@ if __name__ == "__main__":
     parser.add_argument("--concurrent", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--skip-collocated", action="store_true")
+    parser.add_argument("--skip-disaggregated", action="store_true")
     
     asyncio.run(run_suite(parser.parse_args()))
