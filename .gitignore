@@ -1,0 +1,51 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark results — keep CSVs, ignore temp files
+benchmark/results/*.tmp
+
+# Analysis outputs
+analysis/figures/*.png
+analysis/figures/*.pdf
+
+# Model cache (don't commit multi-GB model weights)
+models/
+.cache/
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets
+*.pem
+*.key
