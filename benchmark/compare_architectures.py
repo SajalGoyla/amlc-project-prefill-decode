@@ -143,8 +143,17 @@ async def run_suite(args):
         ttft = [r["ttft_ms"] for r in results]
         tpot = [r["tpot_ms"] for r in results]
         e2e = [r["e2e_lat"] for r in results]
+        
         print(f"\n## {name} Metrics (Concurrent Load: {args.concurrent})")
         print(f"  Avg TTFT (Time-To-First-Token) : {np.mean(ttft):.1f} ms")
+        
+        # Isolate the exact Compute vs Network Cost mathematically
+        if "forward_time_ms" in results[0] and results[0]["forward_time_ms"] > 0:
+            avg_forward = np.mean([r["forward_time_ms"] for r in results])
+            network_cost = np.mean(ttft) - avg_forward
+            print(f"     => GPU Prefill Compute Time :  {avg_forward:.1f} ms")
+            print(f"     => KV Network Transfer Time :  {network_cost:.1f} ms")
+            
         print(f"  Avg TPOT (Time-Per-Output)     : {np.mean(tpot):.1f} ms")
         print(f"  Total Batch Generation Time    : {np.max(e2e)/1000.0:.2f} seconds")
         print(f"  Cumulative System Throughput   : {sum([r['tokens'] for r in results]) / (np.max(e2e)/1000.0):.1f} tokens/sec")

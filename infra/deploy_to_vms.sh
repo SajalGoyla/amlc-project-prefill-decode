@@ -32,7 +32,10 @@ APP_FILES=(
     "app/gateway.py"
     "app/prefill_worker.py"
     "app/decode_worker.py"
+    "app/collocated_baseline.py"
     "benchmark/benchmark.py"
+    "benchmark/concurrent_workload.py"
+    "benchmark/compare_architectures.py"
     "requirements.txt"
     ".env"
 )

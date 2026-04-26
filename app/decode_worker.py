@@ -198,6 +198,7 @@ def run_decode(
     last_token_id: int,
     max_new_tokens: int,
     num_prompt_tokens: int,
+    forward_time_ms: float = 0.0,
 ) -> dict:
     """
     Run the autoregressive decode phase using the reconstructed KV cache.
@@ -269,6 +270,7 @@ def run_decode(
         "status":"complete",
         "tpot_ms": round(tpot_ms, 2),
         "decode_time_ms": round(decode_time_ms, 2),
+        "forward_time_ms": round(forward_time_ms, 2),
         "tokens": num_generated
     }
 
@@ -430,6 +432,7 @@ def run_zmq_listener(test_mode: bool = False):
                             last_token_id=last_token_id,
                             max_new_tokens=max_new_tokens,
                             num_prompt_tokens=num_prompt_tokens,
+                            forward_time_ms=prefill_time_ms,
                         )
                         logger.info(
                             "Decode result for session '%s': %d tokens, %.1f ms total",
