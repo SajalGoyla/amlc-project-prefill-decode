@@ -31,7 +31,8 @@ load_dotenv()
 
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8000"))
-PREFILL_WORKER_HOST = os.getenv("PREFILL_WORKER_HOST", "10.128.0.2")
+# Force localhost since Gateway and Prefill Worker are always collocated on the same VM
+PREFILL_WORKER_HOST = "127.0.0.1"
 PREFILL_WORKER_PORT = int(os.getenv("PREFILL_WORKER_PORT", "8001"))
 
 PREFILL_URL = f"http://{PREFILL_WORKER_HOST}:{PREFILL_WORKER_PORT}/prefill"

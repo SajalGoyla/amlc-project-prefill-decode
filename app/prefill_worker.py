@@ -22,6 +22,7 @@ import time
 import pickle
 import logging
 import threading
+import asyncio
 from contextlib import asynccontextmanager
 
 import torch
@@ -381,9 +382,40 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
 
 
 # ==============================================================================
-# FastAPI Application
+# Background Worker Queue
 # ==============================================================================
 
+prefill_queue: asyncio.Queue = asyncio.Queue()
+
+async def prefill_worker_loop():
+    """Background task that processes prefill requests sequentially."""
+    logger.info("Prefill worker loop started.")
+    while True:
+        request_data = await prefill_queue.get()
+        session_id = request_data["session_id"]
+        prompt = request_data["prompt"]
+        max_new_tokens = request_data["max_new_tokens"]
+
+        try:
+            logger.info("Processing queued prefill for session '%s'", session_id)
+            # Run the blocking PyTorch compute in a background thread to keep event loop free
+            await asyncio.to_thread(
+                run_prefill,
+                session_id=session_id,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+            )
+        except torch.cuda.OutOfMemoryError:
+            logger.error("CUDA OOM during prefill for session '%s'", session_id)
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.exception("Prefill failed for session '%s': %s", session_id, e)
+        finally:
+            prefill_queue.task_done()
+
+# ==============================================================================
+# FastAPI Application
+# ==============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -397,9 +429,13 @@ async def lifespan(app: FastAPI):
     load_model()
     setup_zmq()
 
+    # Start the background prefill processing loop
+    worker_task = asyncio.create_task(prefill_worker_loop())
+
     yield
 
     # Cleanup
+    worker_task.cancel()
     logger.info("Prefill Worker shutting down.")
     if zmq_socket:
         zmq_socket.close()
@@ -430,30 +466,28 @@ async def health():
 @app.post("/prefill", response_model=PrefillResponse)
 async def prefill_endpoint(request: PrefillRequest):
     """
-    Receive a prompt from the Gateway, run the prefill forward pass,
-    and stream KV-cache to the Decode Worker.
+    Receive a prompt from the Gateway, enqueue it for processing,
+    and return immediately so the Gateway is not blocked.
     """
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
-    try:
-        result = run_prefill(
-            session_id=request.session_id,
-            prompt=request.prompt,
-            max_new_tokens=request.max_new_tokens,
-        )
-        return PrefillResponse(**result)
+    # Enqueue the request
+    await prefill_queue.put({
+        "session_id": request.session_id,
+        "prompt": request.prompt,
+        "max_new_tokens": request.max_new_tokens,
+    })
 
-    except torch.cuda.OutOfMemoryError:
-        logger.error("CUDA OOM during prefill for session '%s'", request.session_id)
-        torch.cuda.empty_cache()
-        raise HTTPException(
-            status_code=507,
-            detail="GPU out of memory. Try a shorter prompt or reduce max_new_tokens.",
-        )
-    except Exception as e:
-        logger.exception("Prefill failed for session '%s': %s", request.session_id, e)
-        raise HTTPException(status_code=500, detail=str(e))
+    logger.info("Enqueued session '%s'. Queue size: %d", request.session_id, prefill_queue.qsize())
+
+    # Return immediately
+    return PrefillResponse(
+        session_id=request.session_id,
+        status="queued",
+        num_prompt_tokens=0,
+        forward_time_ms=0.0,
+    )
 
 
 # ==============================================================================
