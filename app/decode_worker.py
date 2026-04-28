@@ -20,6 +20,8 @@ import time
 import pickle
 import logging
 import argparse
+import threading
+import queue
 from collections import defaultdict
 
 import torch
@@ -292,6 +294,71 @@ def run_decode(
 
 
 # ==============================================================================
+# Background Decode Worker
+# ==============================================================================
+
+import queue
+decode_queue = queue.Queue()
+
+def decode_worker_loop():
+    """
+    Background thread that pulls from the decode_queue and processes
+    requests strictly sequentially. This prevents multiple threads from
+    hammering the GPU with concurrent model.generate() calls.
+    """
+    logger.info("Background decode worker loop started.")
+    while True:
+        task = decode_queue.get()
+        sid = task["session_id"]
+        
+        try:
+            # Reconstruct past_key_values (measure reconstruction time)
+            t_recon_start = time.perf_counter()
+            past_key_values = reconstruct_past_key_values(sid, task["num_layers"])
+            cache_reconstruct_ms = (time.perf_counter() - t_recon_start) * 1000
+            logger.info("Session '%s': Cache reconstruction: %.1f ms", sid, cache_reconstruct_ms)
+        except ValueError as e:
+            logger.error("KV reconstruction failed for session '%s': %s", sid, e)
+            if sid in kv_cache_store:
+                del kv_cache_store[sid]
+            decode_queue.task_done()
+            continue
+
+        # Run decode
+        try:
+            result = run_decode(
+                session_id=sid,
+                past_key_values=past_key_values,
+                last_token_id=task["last_token_id"],
+                max_new_tokens=task["max_new_tokens"],
+                num_prompt_tokens=task["num_prompt_tokens"],
+                forward_time_ms=task["prefill_time_ms"],
+                kv_receive_time_ms=task["kv_receive_time_ms"],
+                cache_reconstruct_ms=cache_reconstruct_ms,
+            )
+            logger.info(
+                "Decode result for session '%s': %d tokens, %.1f ms total",
+                sid,
+                result["num_tokens_generated"],
+                result["decode_time_ms"],
+            )
+            # Save to metrics store for the benchmark script to poll
+            metrics_store[sid] = result
+        except torch.cuda.OutOfMemoryError:
+            logger.error("CUDA OOM during decode for session '%s'", sid)
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.exception("Decode failed for session '%s': %s", sid, e)
+        finally:
+            # Clean up session from cache and timing
+            if sid in kv_cache_store:
+                del kv_cache_store[sid]
+            if sid in session_timing:
+                del session_timing[sid]
+            logger.info("Cleaned up KV cache for session '%s'.", sid)
+            decode_queue.task_done()
+
+# ==============================================================================
 # Background API Server for Metrics
 # ==============================================================================
 
@@ -431,68 +498,18 @@ def run_zmq_listener(test_mode: bool = False):
                             del kv_cache_store[session_id]
                         continue
 
-                    # Run decode in background thread to avoid blocking ZMQ listener
-                    def _decode_task(sid, n_layers, max_tok, prompt_tok, last_tok, fwd_time, kv_time):
-                        # Reconstruct past_key_values (measure reconstruction time)
-                        try:
-                            t_recon_start = time.perf_counter()
-                            past_key_values = reconstruct_past_key_values(
-                                sid, n_layers
-                            )
-                            cache_reconstruct_ms = (time.perf_counter() - t_recon_start) * 1000
-                            logger.info("Session '%s': Cache reconstruction: %.1f ms", sid, cache_reconstruct_ms)
-                        except ValueError as e:
-                            logger.error("KV reconstruction failed: %s", e)
-                            if sid in kv_cache_store:
-                                del kv_cache_store[sid]
-                            return
-
-                        # Run decode
-                        try:
-                            result = run_decode(
-                                session_id=sid,
-                                past_key_values=past_key_values,
-                                last_token_id=last_tok,
-                                max_new_tokens=max_tok,
-                                num_prompt_tokens=prompt_tok,
-                                forward_time_ms=fwd_time,
-                                kv_receive_time_ms=kv_time,
-                                cache_reconstruct_ms=cache_reconstruct_ms,
-                            )
-                            logger.info(
-                                "Decode result for session '%s': %d tokens, %.1f ms total",
-                                sid,
-                                result["num_tokens_generated"],
-                                result["decode_time_ms"],
-                            )
-                        except torch.cuda.OutOfMemoryError:
-                            logger.error(
-                                "CUDA OOM during decode for session '%s'",
-                                sid,
-                            )
-                            torch.cuda.empty_cache()
-                        except Exception as e:
-                            logger.exception(
-                                "Decode failed for session '%s': %s", sid, e
-                            )
-
-                        # Clean up session from cache and timing
-                        if sid in kv_cache_store:
-                            del kv_cache_store[sid]
-                        if sid in session_timing:
-                            del session_timing[sid]
-                        logger.info("Cleaned up KV cache for session '%s'.", sid)
-
-                    # Start the background decode task
-                    t = threading.Thread(
-                        target=_decode_task,
-                        args=(
-                            session_id, num_layers, max_new_tokens, num_prompt_tokens,
-                            last_token_id, prefill_time_ms, kv_receive_time_ms
-                        ),
-                        daemon=True
-                    )
-                    t.start()
+                    # Put the decode task into the sequential queue
+                    # This frees the ZMQ listener to keep buffering incoming layers
+                    decode_queue.put({
+                        "session_id": session_id,
+                        "num_layers": num_layers,
+                        "max_new_tokens": max_new_tokens,
+                        "num_prompt_tokens": num_prompt_tokens,
+                        "last_token_id": last_token_id,
+                        "prefill_time_ms": prefill_time_ms,
+                        "kv_receive_time_ms": kv_receive_time_ms,
+                    })
+                    logger.info("Enqueued decode job for session '%s'. Queue size: %d", session_id, decode_queue.qsize())
 
                 else:
                     logger.warning(
@@ -546,6 +563,10 @@ def main():
         api_t = threading.Thread(target=run_metrics_api, daemon=True)
         api_t.start()
         logger.info("Background REST API thread started on port %d", DECODE_PORT)
+
+        # Start the dedicated sequential decode thread
+        decode_t = threading.Thread(target=decode_worker_loop, daemon=True)
+        decode_t.start()
 
     run_zmq_listener(test_mode=args.test_zmq)
 
