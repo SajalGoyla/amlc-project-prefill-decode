@@ -203,8 +203,12 @@ async def run_disaggregated_single(
             async with session.get(f"{gateway_url}/status/{session_id}") as resp:
                 if resp.status == 200:
                     s = await resp.json()
-                    if s.get("status") in ("prefill_accepted", "error", "prefill_error"):
+                    status = s.get("status")
+                    if status == "prefill_accepted":
                         break
+                    elif status in ("error", "prefill_error", "connection_error"):
+                        log.error("Gateway reported error for session %s: %s", session_id, s.get("error", "Unknown error"))
+                        return None
         except Exception:
             pass
         await asyncio.sleep(POLL_INTERVAL)
