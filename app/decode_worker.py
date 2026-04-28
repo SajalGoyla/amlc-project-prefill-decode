@@ -67,6 +67,9 @@ kv_cache_store: dict[str, dict[int, tuple]] = defaultdict(dict)
 # Session metadata: { session_id: { ... } }
 session_metadata: dict[str, dict] = {}
 
+# Per-session KV receive timing: { session_id: { kv_start: float } }
+session_timing: dict[str, dict] = {}
+
 
 # ==============================================================================
 # Model Loading
@@ -199,6 +202,8 @@ def run_decode(
     max_new_tokens: int,
     num_prompt_tokens: int,
     forward_time_ms: float = 0.0,
+    kv_receive_time_ms: float = 0.0,
+    cache_reconstruct_ms: float = 0.0,
 ) -> dict:
     """
     Run the autoregressive decode phase using the reconstructed KV cache.
@@ -271,7 +276,10 @@ def run_decode(
         "tpot_ms": round(tpot_ms, 2),
         "decode_time_ms": round(decode_time_ms, 2),
         "forward_time_ms": round(forward_time_ms, 2),
-        "tokens": num_generated
+        "kv_receive_time_ms": round(kv_receive_time_ms, 2),
+        "cache_reconstruct_ms": round(cache_reconstruct_ms, 2),
+        "tokens": num_generated,
+        "num_prompt_tokens": num_prompt_tokens,
     }
 
     return {
@@ -356,6 +364,10 @@ def run_zmq_listener(test_mode: bool = False):
                     key_tensor = payload["key"]
                     value_tensor = payload["value"]
 
+                    # Track when first KV layer arrives for this session
+                    if session_id not in session_timing:
+                        session_timing[session_id] = {"kv_start": time.perf_counter()}
+
                     # Buffer in memory
                     kv_cache_store[session_id][layer_idx] = (key_tensor, value_tensor)
 
@@ -371,6 +383,12 @@ def run_zmq_listener(test_mode: bool = False):
                     )
 
                 elif msg_type == "prefill_complete":
+                    # Calculate KV receive time (network transfer)
+                    kv_receive_time_ms = 0.0
+                    if session_id in session_timing:
+                        kv_receive_time_ms = (time.perf_counter() - session_timing[session_id]["kv_start"]) * 1000
+                        logger.info("Session '%s': KV receive time (network): %.1f ms", session_id, kv_receive_time_ms)
+
                     num_layers = payload["num_layers"]
                     max_new_tokens = payload["max_new_tokens"]
                     num_prompt_tokens = payload["num_prompt_tokens"]
@@ -413,11 +431,14 @@ def run_zmq_listener(test_mode: bool = False):
                             del kv_cache_store[session_id]
                         continue
 
-                    # Reconstruct past_key_values
+                    # Reconstruct past_key_values (measure reconstruction time)
                     try:
+                        t_recon_start = time.perf_counter()
                         past_key_values = reconstruct_past_key_values(
                             session_id, num_layers
                         )
+                        cache_reconstruct_ms = (time.perf_counter() - t_recon_start) * 1000
+                        logger.info("Session '%s': Cache reconstruction: %.1f ms", session_id, cache_reconstruct_ms)
                     except ValueError as e:
                         logger.error("KV reconstruction failed: %s", e)
                         if session_id in kv_cache_store:
@@ -433,6 +454,8 @@ def run_zmq_listener(test_mode: bool = False):
                             max_new_tokens=max_new_tokens,
                             num_prompt_tokens=num_prompt_tokens,
                             forward_time_ms=prefill_time_ms,
+                            kv_receive_time_ms=kv_receive_time_ms,
+                            cache_reconstruct_ms=cache_reconstruct_ms,
                         )
                         logger.info(
                             "Decode result for session '%s': %d tokens, %.1f ms total",
@@ -451,10 +474,12 @@ def run_zmq_listener(test_mode: bool = False):
                             "Decode failed for session '%s': %s", session_id, e
                         )
 
-                    # Clean up session from cache
+                    # Clean up session from cache and timing
                     if session_id in kv_cache_store:
                         del kv_cache_store[session_id]
-                        logger.info("Cleaned up KV cache for session '%s'.", session_id)
+                    if session_id in session_timing:
+                        del session_timing[session_id]
+                    logger.info("Cleaned up KV cache for session '%s'.", session_id)
 
                 else:
                     logger.warning(
