@@ -42,7 +42,8 @@ load_dotenv()
 PREFILL_HOST = os.getenv("PREFILL_WORKER_HOST", "0.0.0.0")
 PREFILL_PORT = int(os.getenv("PREFILL_WORKER_PORT", "8001"))
 
-DECODE_WORKER_HOST = os.getenv("DECODE_WORKER_HOST", "10.128.0.3")
+# Fallback to the actual Decode VM Internal IP if .env is missing on the VM
+DECODE_WORKER_HOST = os.getenv("DECODE_WORKER_HOST", "10.20.0.2")
 ZMQ_PORT = int(os.getenv("ZMQ_PORT", "5555"))
 
 MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
