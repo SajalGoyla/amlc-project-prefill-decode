@@ -486,8 +486,8 @@ async def prefill_endpoint(request: PrefillRequest):
     return PrefillResponse(
         session_id=request.session_id,
         status="queued",
-        num_prompt_tokens=0,
-        forward_time_ms=0.0,
+        num_layers_streamed=0,
+        prefill_time_ms=0.0,
     )
 
 
