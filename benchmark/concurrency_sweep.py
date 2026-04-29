@@ -13,22 +13,24 @@ Key insight:
 
 Metrics per concurrency level:
   - avg / p50 / p99 TPOT
-  - avg TTFT (compute only)
+  - avg_compute_ttft_ms  (pure GPU prefill time — no queue wait)
+  - avg_true_ttft_ms     (server-side: includes queue wait before prefill)
+  - avg_e2e_ms           (client-side: total round-trip per request)
   - batch wall-clock time
   - throughput (total tokens / wall-clock seconds)
 
 Usage:
     # Against collocated baseline:
-    python benchmark/concurrency_sweep.py \
-        --mode collocated \
-        --url http://<COLLOCATED_VM_IP>:8000 \
+    python benchmark/concurrency_sweep.py \\
+        --mode collocated \\
+        --url http://<COLLOCATED_VM_IP>:8000 \\
         --output benchmark_results/concurrency_collocated.csv
 
     # Against disaggregated pipeline:
-    python benchmark/concurrency_sweep.py \
-        --mode disaggregated \
-        --url http://<GATEWAY_IP>:8000 \
-        --decode-url http://<DECODE_VM_IP>:8002 \
+    python benchmark/concurrency_sweep.py \\
+        --mode disaggregated \\
+        --url http://<GATEWAY_IP>:8000 \\
+        --decode-url http://<DECODE_VM_IP>:8002 \\
         --output benchmark_results/concurrency_disaggregated.csv
 """
 
@@ -62,7 +64,7 @@ DEFAULT_REPS          = 3   # full batch repetitions per concurrency level
 CHARS_PER_TOKEN = 4
 POLL_INTERVAL   = 0.3
 POLL_TIMEOUT    = 600.0
-STAGGER_MS      = 100      # ms between concurrent request launches
+STAGGER_MS      = 50       # ms between concurrent request launches
 
 # ==============================================================================
 # Logging
@@ -101,7 +103,7 @@ def generate_prompt(target_tokens: int) -> str:
 
 
 # ==============================================================================
-# Single-Request Runners (same logic as prompt_sweep.py)
+# Single-Request Runners
 # ==============================================================================
 
 async def _run_collocated(session, url, prompt, max_tokens, sid):
@@ -122,12 +124,13 @@ async def _run_collocated(session, url, prompt, max_tokens, sid):
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("status") == "complete":
+                        e2e_ms = (time.perf_counter() - t0) * 1000
                         return {
                             "compute_ttft_ms": data.get("compute_ttft_ms", data.get("ttft_ms", 0)),
                             "true_ttft_ms":    data.get("true_ttft_ms", data.get("ttft_ms", 0)),
-                            "tpot_ms":         data["tpot_ms"],
-                            "tokens":          data["tokens"],
-                            "e2e_ms":          (time.perf_counter() - t0) * 1000,
+                            "tpot_ms":         data.get("tpot_ms", 0),
+                            "tokens":          data.get("tokens", 0),
+                            "e2e_ms":          round(e2e_ms, 2),
                         }
                     if data.get("status") == "error":
                         return None
@@ -172,13 +175,14 @@ async def _run_disaggregated(session, gw_url, dec_url, prompt, max_tokens, sid):
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("status") == "complete":
+                        e2e_ms = (time.perf_counter() - t0) * 1000
                         return {
                             "compute_ttft_ms": data.get("forward_time_ms", 0),
                             "true_ttft_ms":    data.get("true_ttft_ms", data.get("forward_time_ms", 0)),
                             "tpot_ms":         data.get("tpot_ms", 0),
                             "kv_transfer_ms":  data.get("kv_receive_time_ms", 0),
                             "tokens":          data.get("tokens", 0),
-                            "e2e_ms":          (time.perf_counter() - t0) * 1000,
+                            "e2e_ms":          round(e2e_ms, 2),
                         }
         except Exception:
             pass
@@ -201,8 +205,8 @@ async def run_batch(session, args, concurrency, prompt, rep):
             coro = _run_disaggregated(
                 session, args.url, args.decode_url, prompt, args.max_tokens, sid,
             )
-        await asyncio.sleep(STAGGER_MS / 1000.0)
         tasks.append(asyncio.create_task(coro))
+        await asyncio.sleep(STAGGER_MS / 1000.0)
 
     t_batch_start = time.perf_counter()
     results = await asyncio.gather(*tasks)
@@ -243,31 +247,33 @@ async def run_sweep(args):
                     log.warning("  → All %d requests failed", conc)
                     continue
 
-                tpots  = [r["tpot_ms"] for r in valid]
+                tpots      = [r["tpot_ms"] for r in valid]
                 true_ttfts = [r["true_ttft_ms"] for r in valid]
+                e2es       = [r["e2e_ms"] for r in valid]
                 total_tokens = sum(r["tokens"] for r in valid)
                 throughput   = total_tokens / wall_s if wall_s > 0 else 0
 
                 row = {
-                    "mode":            args.mode,
-                    "concurrency":     conc,
-                    "rep":             rep,
-                    "successful":      len(valid),
-                    "avg_tpot_ms":     round(float(np.mean(tpots)), 2),
-                    "p50_tpot_ms":     round(float(np.percentile(tpots, 50)), 2),
-                    "p99_tpot_ms":     round(float(np.percentile(tpots, 99)), 2),
-                    "avg_true_ttft_ms": round(float(np.mean(true_ttfts)), 2),
-                    "total_tokens":    total_tokens,
-                    "wall_clock_s":    round(wall_s, 2),
-                    "throughput_tps":  round(throughput, 1),
+                    "mode":              args.mode,
+                    "concurrency":       conc,
+                    "rep":               rep,
+                    "successful":        len(valid),
+                    "avg_tpot_ms":       round(float(np.mean(tpots)), 2),
+                    "p50_tpot_ms":       round(float(np.percentile(tpots, 50)), 2),
+                    "p99_tpot_ms":       round(float(np.percentile(tpots, 99)), 2),
+                    "avg_true_ttft_ms":  round(float(np.mean(true_ttfts)), 2),
+                    "avg_e2e_ms":        round(float(np.mean(e2es)), 2),
+                    "total_tokens":      total_tokens,
+                    "wall_clock_s":      round(wall_s, 2),
+                    "throughput_tps":    round(throughput, 1),
                 }
                 csv_rows.append(row)
 
                 log.info(
                     "  → ok=%d  avg_tpot=%.1f  avg_true_ttft=%.1f  "
-                    "throughput=%.1f tok/s  wall=%.1f s",
+                    "avg_e2e=%.0f  throughput=%.1f tok/s  wall=%.1f s",
                     len(valid), row["avg_tpot_ms"], row["avg_true_ttft_ms"],
-                    throughput, wall_s,
+                    row["avg_e2e_ms"], throughput, wall_s,
                 )
 
                 # Cooldown between batches

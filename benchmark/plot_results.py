@@ -5,19 +5,21 @@ Reads CSV outputs from prompt_sweep.py and concurrency_sweep.py,
 then generates publication-quality figures for the report.
 
 Produces:
-  1. Crossover Curve   — Compute TTFT vs Prompt Length (both architectures)
-  2. Network Overhead  — KV transfer + reconstruction vs Prompt Length
-  3. TPOT Stability    — Average TPOT vs Prompt Length
-  4. Concurrency Scaling — Throughput vs Concurrency Level
-  5. Concurrency TPOT   — Average TPOT vs Concurrency Level
-  6. Cost Per Token     — Collocated vs Disaggregated
+  1. Crossover Curve   - Compute TTFT vs Prompt Length (both architectures)
+  2. Network Overhead  - KV transfer + reconstruction vs Prompt Length
+  3. TPOT Stability    - Average TPOT vs Prompt Length
+  4. Concurrency Scaling - Throughput vs Concurrency Level
+  5. Concurrency TPOT   - Average TPOT vs Concurrency Level
+  6. True TTFT vs Concurrency - Queue-inclusive TTFT under concurrent load
+  7. E2E Latency vs Concurrency - Client-visible latency per request
+  8. Cost Per Token     - Collocated vs Disaggregated
 
 Usage:
-    python benchmark/plot_results.py \
-        --collocated-sweep  benchmark_results/sweep_collocated.csv \
-        --disaggregated-sweep benchmark_results/sweep_disaggregated.csv \
-        --collocated-conc   benchmark_results/concurrency_collocated.csv \
-        --disaggregated-conc benchmark_results/concurrency_disaggregated.csv \
+    python benchmark/plot_results.py \\
+        --collocated-sweep  benchmark_results/sweep_collocated.csv \\
+        --disaggregated-sweep benchmark_results/sweep_disaggregated.csv \\
+        --collocated-conc   benchmark_results/concurrency_collocated.csv \\
+        --disaggregated-conc benchmark_results/concurrency_disaggregated.csv \\
         --outdir benchmark_results/figures
 """
 
@@ -28,7 +30,7 @@ import numpy as np
 
 try:
     import matplotlib
-    matplotlib.use("Agg")       # headless — works on VMs without display
+    matplotlib.use("Agg")       # headless - works on VMs without display
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MaxNLocator
 except ImportError:
@@ -71,12 +73,20 @@ def read_csv(path: str) -> list[dict]:
         return list(csv.DictReader(f))
 
 
+def filter_warmup(rows):
+    """Remove rep=1 rows to exclude GPU warm-up outliers."""
+    return [r for r in rows if int(r.get("rep", 1)) > 1]
+
+
 def group_by(rows, key_col, val_col):
     """Group rows by key_col and aggregate val_col values (median ± std)."""
     from collections import defaultdict
     buckets = defaultdict(list)
     for r in rows:
-        buckets[float(r[key_col])].append(float(r[val_col]))
+        try:
+            buckets[float(r[key_col])].append(float(r[val_col]))
+        except (KeyError, ValueError):
+            continue
     keys = sorted(buckets.keys())
     medians = [np.median(buckets[k]) for k in keys]
     stds    = [np.std(buckets[k]) for k in keys]
@@ -88,8 +98,8 @@ def group_by(rows, key_col, val_col):
 # ==============================================================================
 
 def plot_crossover(coloc_csv, disag_csv, outdir):
-    coloc = read_csv(coloc_csv)
-    disag = read_csv(disag_csv)
+    coloc = filter_warmup(read_csv(coloc_csv))
+    disag = filter_warmup(read_csv(disag_csv))
 
     c_x, c_y, c_err = group_by(coloc, "target_tokens", "compute_ttft_ms")
     d_x, d_y, d_err = group_by(disag, "target_tokens", "compute_ttft_ms")
@@ -107,11 +117,9 @@ def plot_crossover(coloc_csv, disag_csv, outdir):
         idx_c2 = list(c_x).index(common[i + 1])
         idx_d1 = list(d_x).index(common[i])
         idx_d2 = list(d_x).index(common[i + 1])
-        # Check sign change in (collocated - disaggregated)
         diff1 = c_y[idx_c1] - d_y[idx_d1]
         diff2 = c_y[idx_c2] - d_y[idx_d2]
         if diff1 * diff2 < 0:
-            # Linear interpolation for crossover
             frac = abs(diff1) / (abs(diff1) + abs(diff2))
             cross_n = common[i] + frac * (common[i + 1] - common[i])
             ax.axvline(x=cross_n, color="green", linestyle="--", alpha=0.7,
@@ -120,14 +128,14 @@ def plot_crossover(coloc_csv, disag_csv, outdir):
 
     ax.set_xlabel("Prompt Length (tokens)")
     ax.set_ylabel("Compute TTFT (ms)")
-    ax.set_title("Compute TTFT vs Prompt Length — Crossover Curve")
+    ax.set_title("Compute TTFT vs Prompt Length - Crossover Curve")
     ax.legend()
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
     path = os.path.join(outdir, "crossover_curve.png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ {path}")
+    print(f"  [OK] {path}")
 
 
 # ==============================================================================
@@ -135,7 +143,7 @@ def plot_crossover(coloc_csv, disag_csv, outdir):
 # ==============================================================================
 
 def plot_network_overhead(disag_csv, outdir):
-    disag = read_csv(disag_csv)
+    disag = filter_warmup(read_csv(disag_csv))
 
     x_kv, y_kv, e_kv   = group_by(disag, "target_tokens", "kv_transfer_ms")
     x_rc, y_rc, e_rc    = group_by(disag, "target_tokens", "cache_recon_ms")
@@ -148,13 +156,13 @@ def plot_network_overhead(disag_csv, outdir):
 
     ax.set_xlabel("Prompt Length (tokens)")
     ax.set_ylabel("Time (ms)")
-    ax.set_title("Disaggregated Overhead — Network + Reconstruction vs Prompt Length")
+    ax.set_title("Disaggregated Overhead - Network + Reconstruction vs Prompt Length")
     ax.legend()
 
     path = os.path.join(outdir, "network_overhead.png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ {path}")
+    print(f"  [OK] {path}")
 
 
 # ==============================================================================
@@ -162,8 +170,8 @@ def plot_network_overhead(disag_csv, outdir):
 # ==============================================================================
 
 def plot_tpot_vs_length(coloc_csv, disag_csv, outdir):
-    coloc = read_csv(coloc_csv)
-    disag = read_csv(disag_csv)
+    coloc = filter_warmup(read_csv(coloc_csv))
+    disag = filter_warmup(read_csv(disag_csv))
 
     c_x, c_y, c_e = group_by(coloc, "target_tokens", "tpot_ms")
     d_x, d_y, d_e = group_by(disag, "target_tokens", "tpot_ms")
@@ -182,7 +190,7 @@ def plot_tpot_vs_length(coloc_csv, disag_csv, outdir):
     path = os.path.join(outdir, "tpot_vs_length.png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ {path}")
+    print(f"  [OK] {path}")
 
 
 # ==============================================================================
@@ -190,8 +198,8 @@ def plot_tpot_vs_length(coloc_csv, disag_csv, outdir):
 # ==============================================================================
 
 def plot_concurrency_throughput(coloc_csv, disag_csv, outdir):
-    coloc = read_csv(coloc_csv)
-    disag = read_csv(disag_csv)
+    coloc = filter_warmup(read_csv(coloc_csv))
+    disag = filter_warmup(read_csv(disag_csv))
 
     c_x, c_y, c_e = group_by(coloc, "concurrency", "throughput_tps")
     d_x, d_y, d_e = group_by(disag, "concurrency", "throughput_tps")
@@ -202,22 +210,6 @@ def plot_concurrency_throughput(coloc_csv, disag_csv, outdir):
     ax.errorbar(d_x, d_y, yerr=d_e, fmt="-s", color=COLOR_DISAGGREGATED,
                 label="Disaggregated", capsize=3)
 
-    # Find crossover in throughput
-    common = sorted(set(c_x) & set(d_x))
-    for i in range(len(common) - 1):
-        idx_c1 = list(c_x).index(common[i])
-        idx_c2 = list(c_x).index(common[i + 1])
-        idx_d1 = list(d_x).index(common[i])
-        idx_d2 = list(d_x).index(common[i + 1])
-        diff1 = d_y[idx_d1] - c_y[idx_c1]
-        diff2 = d_y[idx_d2] - c_y[idx_c2]
-        if diff1 * diff2 < 0:
-            frac = abs(diff1) / (abs(diff1) + abs(diff2))
-            cross_c = common[i] + frac * (common[i + 1] - common[i])
-            ax.axvline(x=cross_c, color="green", linestyle="--", alpha=0.7,
-                       label=f"Crossover ≈ {cross_c:.0f} concurrent")
-            break
-
     ax.set_xlabel("Concurrent Requests")
     ax.set_ylabel("Throughput (tokens/sec)")
     ax.set_title("Throughput vs Concurrency Level")
@@ -227,7 +219,7 @@ def plot_concurrency_throughput(coloc_csv, disag_csv, outdir):
     path = os.path.join(outdir, "concurrency_throughput.png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ {path}")
+    print(f"  [OK] {path}")
 
 
 # ==============================================================================
@@ -235,8 +227,8 @@ def plot_concurrency_throughput(coloc_csv, disag_csv, outdir):
 # ==============================================================================
 
 def plot_concurrency_tpot(coloc_csv, disag_csv, outdir):
-    coloc = read_csv(coloc_csv)
-    disag = read_csv(disag_csv)
+    coloc = filter_warmup(read_csv(coloc_csv))
+    disag = filter_warmup(read_csv(disag_csv))
 
     c_x, c_y, c_e = group_by(coloc, "concurrency", "avg_tpot_ms")
     d_x, d_y, d_e = group_by(disag, "concurrency", "avg_tpot_ms")
@@ -256,16 +248,86 @@ def plot_concurrency_tpot(coloc_csv, disag_csv, outdir):
     path = os.path.join(outdir, "concurrency_tpot.png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ {path}")
+    print(f"  [OK] {path}")
 
 
 # ==============================================================================
-# Figure 6: Cost Per Token
+# Figure 6: True TTFT vs Concurrency
+# ==============================================================================
+
+def plot_concurrency_ttft(coloc_csv, disag_csv, outdir):
+    coloc = filter_warmup(read_csv(coloc_csv))
+    disag = filter_warmup(read_csv(disag_csv))
+
+    # Handle both old column name (avg_compute_ttft_ms) and new (avg_true_ttft_ms)
+    coloc_col = "avg_true_ttft_ms" if coloc and "avg_true_ttft_ms" in coloc[0] else "avg_compute_ttft_ms"
+    disag_col = "avg_true_ttft_ms" if disag and "avg_true_ttft_ms" in disag[0] else "avg_compute_ttft_ms"
+
+    c_x, c_y, c_e = group_by(coloc, "concurrency", coloc_col)
+    d_x, d_y, d_e = group_by(disag, "concurrency", disag_col)
+
+    fig, ax = plt.subplots()
+    ax.errorbar(c_x, c_y, yerr=c_e, fmt="-o", color=COLOR_COLLOCATED,
+                label="Collocated (queue + compute)", capsize=3)
+    ax.errorbar(d_x, d_y, yerr=d_e, fmt="-s", color=COLOR_DISAGGREGATED,
+                label="Disaggregated (queue + compute)", capsize=3)
+
+    ax.set_xlabel("Concurrent Requests")
+    ax.set_ylabel("True TTFT (ms) - includes queue wait")
+    ax.set_title("True Time-To-First-Token vs Concurrency")
+    ax.legend()
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    path = os.path.join(outdir, "concurrency_true_ttft.png")
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [OK] {path}")
+
+
+# ==============================================================================
+# Figure 7: Client E2E Latency vs Concurrency
+# ==============================================================================
+
+def plot_concurrency_e2e(coloc_csv, disag_csv, outdir):
+    coloc = filter_warmup(read_csv(coloc_csv))
+    disag = filter_warmup(read_csv(disag_csv))
+
+    if not coloc or "avg_e2e_ms" not in coloc[0]:
+        print("  [WARN] Skipping E2E plot (column not found in collocated CSV)")
+        return
+    if not disag or "avg_e2e_ms" not in disag[0]:
+        print("  [WARN] Skipping E2E plot (column not found in disaggregated CSV)")
+        return
+
+    c_x, c_y, c_e = group_by(coloc, "concurrency", "avg_e2e_ms")
+    d_x, d_y, d_e = group_by(disag, "concurrency", "avg_e2e_ms")
+
+    # Convert to seconds for readability
+    fig, ax = plt.subplots()
+    ax.errorbar(c_x, c_y / 1000, yerr=c_e / 1000, fmt="-o", color=COLOR_COLLOCATED,
+                label="Collocated", capsize=3)
+    ax.errorbar(d_x, d_y / 1000, yerr=d_e / 1000, fmt="-s", color=COLOR_DISAGGREGATED,
+                label="Disaggregated", capsize=3)
+
+    ax.set_xlabel("Concurrent Requests")
+    ax.set_ylabel("Avg Client E2E Latency (seconds)")
+    ax.set_title("Average Per-Request Latency vs Concurrency")
+    ax.legend()
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    path = os.path.join(outdir, "concurrency_e2e_latency.png")
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [OK] {path}")
+
+
+# ==============================================================================
+# Figure 8: Cost Per Token
 # ==============================================================================
 
 def plot_cost(coloc_csv, disag_csv, outdir):
-    coloc = read_csv(coloc_csv)
-    disag = read_csv(disag_csv)
+    coloc = filter_warmup(read_csv(coloc_csv))
+    disag = filter_warmup(read_csv(disag_csv))
 
     c_x, c_e2e, _ = group_by(coloc, "target_tokens", "e2e_ms")
     d_x, d_e2e, _ = group_by(disag, "target_tokens", "e2e_ms")
@@ -282,13 +344,13 @@ def plot_cost(coloc_csv, disag_csv, outdir):
 
     ax.set_xlabel("Prompt Length (tokens)")
     ax.set_ylabel("Cost per Token (μ$)")
-    ax.set_title("Cost per Output Token — GCP On-Demand Pricing")
+    ax.set_title("Cost per Output Token - GCP On-Demand Pricing")
     ax.legend()
 
     path = os.path.join(outdir, "cost_per_token.png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✓ {path}")
+    print(f"  [OK] {path}")
 
 
 # ==============================================================================
@@ -316,20 +378,22 @@ def main():
         plot_tpot_vs_length(args.collocated_sweep, args.disaggregated_sweep, args.outdir)
         plot_cost(args.collocated_sweep, args.disaggregated_sweep, args.outdir)
     else:
-        print("  ⚠ Skipping prompt-sweep figures (need both --collocated-sweep and --disaggregated-sweep)")
+        print("  [WARN] Skipping prompt-sweep figures (need both --collocated-sweep and --disaggregated-sweep)")
 
     # Network overhead (only needs disaggregated)
     if args.disaggregated_sweep:
         plot_network_overhead(args.disaggregated_sweep, args.outdir)
     else:
-        print("  ⚠ Skipping network overhead figure (need --disaggregated-sweep)")
+        print("  [WARN] Skipping network overhead figure (need --disaggregated-sweep)")
 
     # Concurrency figures (need both CSVs)
     if args.collocated_conc and args.disaggregated_conc:
         plot_concurrency_throughput(args.collocated_conc, args.disaggregated_conc, args.outdir)
         plot_concurrency_tpot(args.collocated_conc, args.disaggregated_conc, args.outdir)
+        plot_concurrency_ttft(args.collocated_conc, args.disaggregated_conc, args.outdir)
+        plot_concurrency_e2e(args.collocated_conc, args.disaggregated_conc, args.outdir)
     else:
-        print("  ⚠ Skipping concurrency figures (need both --collocated-conc and --disaggregated-conc)")
+        print("  [WARN] Skipping concurrency figures (need both --collocated-conc and --disaggregated-conc)")
 
     print("=" * 50)
     print("Done!")

@@ -5,19 +5,21 @@ A single-GPU FastAPI server that loads the LLM natively and performs BOTH
 prefill and decode phases sequentially. Used for benchmarking purposes.
 
 Measures and returns exactly:
-- TTFT (Time To First Token)
+- compute_ttft_ms  (pure prefill GPU time)
+- true_ttft_ms     (includes queue wait time — critical for concurrency comparison)
 - TPOT (Time Per Output Token)
 """
 
 import os
 import time
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 import torch
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -52,8 +54,12 @@ model = None
 tokenizer = None
 device = None
 
-# Metrics store: { session_id: { ttft_ms, tpot_ms, tokens, error } }
+# Metrics store: { session_id: { status, compute_ttft_ms, true_ttft_ms, tpot_ms, tokens } }
 metrics_store = {}
+
+# Arrival timestamps: captured IMMEDIATELY in the endpoint handler
+# before any queuing or GPU work. This is the key to correct true_ttft_ms.
+arrival_times = {}
 
 
 def load_model():
@@ -98,39 +104,44 @@ class GenerateResponse(BaseModel):
 
 
 # ==============================================================================
-# Generation Task
+# Synchronous Generation (runs in thread pool via asyncio.to_thread)
 # ==============================================================================
 
 
-async def run_generation(session_id: str, prompt: str, max_new_tokens: int, created_at: float):
-    """Synchronous generation measuring TTFT and TPOT exactly."""
+def run_generation_sync(session_id: str, prompt: str, max_new_tokens: int):
+    """
+    Synchronous generation measuring TTFT and TPOT.
+    Runs in a thread pool so the event loop stays responsive.
+    """
+    # Retrieve the arrival timestamp that was captured in the endpoint handler
+    created_at = arrival_times.get(session_id, time.perf_counter())
+
     logger.info("Starting collocated generation for '%s'", session_id)
     try:
         inputs = tokenizer(
             prompt, return_tensors="pt", padding=True, truncation=True, max_length=4096
         ).to(device)
-        
-        # We manually step generation to accurately measure TTFT and TPOT.
-        # But this is complex to write natively without a TextStreamer.
-        # So we'll approximate: TTFT = model forward pass for entire prompt, 
-        # TPOT = model generation time / tokens.
-        
+
+        # Prefill phase
         t_prefill_start = time.perf_counter()
         with torch.no_grad():
             outputs = model(**inputs, use_cache=True, return_dict=True)
             past_key_values = outputs.past_key_values
-            
+
         t_prefill_end = time.perf_counter()
         compute_ttft_ms = (t_prefill_end - t_prefill_start) * 1000
         true_ttft_ms = (t_prefill_end - created_at) * 1000
-        
-        logger.info("Session '%s': Prefill complete. True TTFT: %.1f ms (Compute: %.1f ms)", session_id, true_ttft_ms, compute_ttft_ms)
+
+        logger.info(
+            "Session '%s': Prefill complete. True TTFT: %.1f ms (Compute: %.1f ms, Queue wait: %.1f ms)",
+            session_id, true_ttft_ms, compute_ttft_ms, true_ttft_ms - compute_ttft_ms,
+        )
 
         # Decode Phase
         input_ids = inputs["input_ids"]
         last_token_id = int(input_ids[0, -1].item())
         decode_input_ids = torch.tensor([[last_token_id]], dtype=torch.long, device=device)
-        
+
         num_prompt_tokens = input_ids.shape[1]
         attention_mask = torch.ones((1, num_prompt_tokens + 1), dtype=torch.long, device=device)
 
@@ -147,14 +158,14 @@ async def run_generation(session_id: str, prompt: str, max_new_tokens: int, crea
                 eos_token_id=tokenizer.eos_token_id,
             )
         t_decode_end = time.perf_counter()
-        
+
         num_generated = generated_ids.shape[1] - 1  # Excluding the seed token
         decode_time_ms = (t_decode_end - t_decode_start) * 1000
         tpot_ms = decode_time_ms / max(num_generated, 1)
 
         logger.info("Session '%s': Decode complete. %d tokens | TPOT: %.2f ms", session_id, num_generated, tpot_ms)
 
-        # Store highly precise internal metrics
+        # Store metrics
         metrics_store[session_id] = {
             "status": "complete",
             "compute_ttft_ms": round(compute_ttft_ms, 2),
@@ -169,6 +180,34 @@ async def run_generation(session_id: str, prompt: str, max_new_tokens: int, crea
     except Exception as e:
         logger.exception("Generation error: %s", e)
         metrics_store[session_id] = {"status": "error", "error": str(e)}
+    finally:
+        # Clean up arrival time
+        arrival_times.pop(session_id, None)
+
+
+# ==============================================================================
+# Background Worker Queue (same pattern as disaggregated prefill_worker)
+# ==============================================================================
+
+generation_queue: asyncio.Queue = asyncio.Queue()
+
+
+async def generation_worker_loop():
+    """Background task that processes generation requests sequentially via thread pool."""
+    logger.info("Generation worker loop started.")
+    while True:
+        request_data = await generation_queue.get()
+        try:
+            await asyncio.to_thread(
+                run_generation_sync,
+                session_id=request_data["session_id"],
+                prompt=request_data["prompt"],
+                max_new_tokens=request_data["max_new_tokens"],
+            )
+        except Exception as e:
+            logger.exception("Generation worker error: %s", e)
+        finally:
+            generation_queue.task_done()
 
 
 # ==============================================================================
@@ -183,6 +222,8 @@ async def lifespan(app: FastAPI):
     logger.info("Collocated Baseline API starting")
     logger.info("=" * 60)
     load_model()
+    # Start the background worker loop
+    asyncio.create_task(generation_worker_loop())
     yield
     logger.info("Collocated API shutting down.")
 
@@ -190,17 +231,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Collocated LLM Baseline", lifespan=lifespan)
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate(request: GenerateRequest, background_tasks: BackgroundTasks):
-    """Accept the request and run the collocated generation in the background."""
+async def generate(request: GenerateRequest):
+    """Accept the request and enqueue for background processing."""
+    # Capture arrival time IMMEDIATELY — before any queuing
+    arrival_times[request.session_id] = time.perf_counter()
     metrics_store[request.session_id] = {"status": "pending"}
-    
-    background_tasks.add_task(
-        run_generation,
-        session_id=request.session_id,
-        prompt=request.prompt,
-        max_new_tokens=request.max_new_tokens,
-        created_at=time.perf_counter(),
-    )
+
+    await generation_queue.put({
+        "session_id": request.session_id,
+        "prompt": request.prompt,
+        "max_new_tokens": request.max_new_tokens,
+    })
+
+    logger.info("Enqueued session '%s'. Queue size: %d", request.session_id, generation_queue.qsize())
     return GenerateResponse(session_id=request.session_id, status="queued")
 
 @app.get("/metrics/{session_id}")
