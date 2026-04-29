@@ -221,7 +221,7 @@ def _send_kv_layer(
 # ==============================================================================
 
 
-def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
+def run_prefill(session_id: str, prompt: str, max_new_tokens: int, created_at: float = 0.0) -> dict:
     """
     Execute the prefill phase:
       1. Tokenize the prompt.
@@ -274,7 +274,8 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
     forward_time_ms = (t_forward_end - t_forward_start) * 1000
     
     # Calculate True TTFT (if created_at is provided, else just fallback to forward_time)
-    true_ttft_ms = (t_forward_end - kwargs.get("created_at", t_forward_start)) * 1000
+    start_time = created_at if created_at > 0 else t_forward_start
+    true_ttft_ms = (t_forward_end - start_time) * 1000
 
     # =========================================================================
     # Extract past_key_values from model output
