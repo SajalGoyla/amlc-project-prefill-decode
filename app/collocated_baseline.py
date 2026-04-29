@@ -102,7 +102,7 @@ class GenerateResponse(BaseModel):
 # ==============================================================================
 
 
-async def run_generation(session_id: str, prompt: str, max_new_tokens: int):
+async def run_generation(session_id: str, prompt: str, max_new_tokens: int, created_at: float):
     """Synchronous generation measuring TTFT and TPOT exactly."""
     logger.info("Starting collocated generation for '%s'", session_id)
     try:
@@ -121,9 +121,10 @@ async def run_generation(session_id: str, prompt: str, max_new_tokens: int):
             past_key_values = outputs.past_key_values
             
         t_prefill_end = time.perf_counter()
-        ttft_ms = (t_prefill_end - t_prefill_start) * 1000
+        compute_ttft_ms = (t_prefill_end - t_prefill_start) * 1000
+        true_ttft_ms = (t_prefill_end - created_at) * 1000
         
-        logger.info("Session '%s': Prefill complete. TTFT: %.1f ms", session_id, ttft_ms)
+        logger.info("Session '%s': Prefill complete. True TTFT: %.1f ms (Compute: %.1f ms)", session_id, true_ttft_ms, compute_ttft_ms)
 
         # Decode Phase
         input_ids = inputs["input_ids"]
@@ -156,7 +157,8 @@ async def run_generation(session_id: str, prompt: str, max_new_tokens: int):
         # Store highly precise internal metrics
         metrics_store[session_id] = {
             "status": "complete",
-            "ttft_ms": round(ttft_ms, 2),
+            "compute_ttft_ms": round(compute_ttft_ms, 2),
+            "true_ttft_ms": round(true_ttft_ms, 2),
             "tpot_ms": round(tpot_ms, 2),
             "tokens": num_generated,
         }
@@ -197,6 +199,7 @@ async def generate(request: GenerateRequest, background_tasks: BackgroundTasks):
         session_id=request.session_id,
         prompt=request.prompt,
         max_new_tokens=request.max_new_tokens,
+        created_at=time.perf_counter(),
     )
     return GenerateResponse(session_id=request.session_id, status="queued")
 

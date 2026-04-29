@@ -204,6 +204,7 @@ def run_decode(
     max_new_tokens: int,
     num_prompt_tokens: int,
     forward_time_ms: float = 0.0,
+    true_ttft_ms: float = 0.0,
     kv_receive_time_ms: float = 0.0,
     cache_reconstruct_ms: float = 0.0,
 ) -> dict:
@@ -278,6 +279,7 @@ def run_decode(
         "tpot_ms": round(tpot_ms, 2),
         "decode_time_ms": round(decode_time_ms, 2),
         "forward_time_ms": round(forward_time_ms, 2),
+        "true_ttft_ms": round(true_ttft_ms, 2),
         "kv_receive_time_ms": round(kv_receive_time_ms, 2),
         "cache_reconstruct_ms": round(cache_reconstruct_ms, 2),
         "tokens": num_generated,
@@ -333,6 +335,7 @@ def decode_worker_loop():
                 max_new_tokens=task["max_new_tokens"],
                 num_prompt_tokens=task["num_prompt_tokens"],
                 forward_time_ms=task["prefill_time_ms"],
+                true_ttft_ms=task.get("true_ttft_ms", task["prefill_time_ms"]),
                 kv_receive_time_ms=task["kv_receive_time_ms"],
                 cache_reconstruct_ms=cache_reconstruct_ms,
             )
@@ -459,14 +462,16 @@ def run_zmq_listener(test_mode: bool = False):
                     num_prompt_tokens = payload["num_prompt_tokens"]
                     last_token_id = payload["last_token_id"]
                     prefill_time_ms = payload.get("forward_time_ms", 0)
+                    true_ttft_ms = payload.get("true_ttft_ms", prefill_time_ms)
 
                     logger.info(
                         "Received PREFILL_COMPLETE for session '%s': "
-                        "%d layers, %d prompt tokens, prefill=%.1f ms",
+                        "%d layers, %d prompt tokens, prefill=%.1f ms, true_ttft=%.1f ms",
                         session_id,
                         num_layers,
                         num_prompt_tokens,
                         prefill_time_ms,
+                        true_ttft_ms,
                     )
 
                     # Check we have all layers
@@ -505,6 +510,7 @@ def run_zmq_listener(test_mode: bool = False):
                         "num_prompt_tokens": num_prompt_tokens,
                         "last_token_id": last_token_id,
                         "prefill_time_ms": prefill_time_ms,
+                        "true_ttft_ms": true_ttft_ms,
                         "kv_receive_time_ms": kv_receive_time_ms,
                     })
                     logger.info("Enqueued decode job for session '%s'. Queue size: %d", session_id, decode_queue.qsize())

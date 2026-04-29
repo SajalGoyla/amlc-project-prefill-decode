@@ -123,7 +123,8 @@ async def _run_collocated(session, url, prompt, max_tokens, sid):
                     data = await resp.json()
                     if data.get("status") == "complete":
                         return {
-                            "compute_ttft_ms": data["ttft_ms"],
+                            "compute_ttft_ms": data.get("compute_ttft_ms", data.get("ttft_ms", 0)),
+                            "true_ttft_ms":    data.get("true_ttft_ms", data.get("ttft_ms", 0)),
                             "tpot_ms":         data["tpot_ms"],
                             "tokens":          data["tokens"],
                             "e2e_ms":          (time.perf_counter() - t0) * 1000,
@@ -173,6 +174,7 @@ async def _run_disaggregated(session, gw_url, dec_url, prompt, max_tokens, sid):
                     if data.get("status") == "complete":
                         return {
                             "compute_ttft_ms": data.get("forward_time_ms", 0),
+                            "true_ttft_ms":    data.get("true_ttft_ms", data.get("forward_time_ms", 0)),
                             "tpot_ms":         data.get("tpot_ms", 0),
                             "kv_transfer_ms":  data.get("kv_receive_time_ms", 0),
                             "tokens":          data.get("tokens", 0),
@@ -242,7 +244,7 @@ async def run_sweep(args):
                     continue
 
                 tpots  = [r["tpot_ms"] for r in valid]
-                ttfts  = [r["compute_ttft_ms"] for r in valid]
+                true_ttfts = [r["true_ttft_ms"] for r in valid]
                 total_tokens = sum(r["tokens"] for r in valid)
                 throughput   = total_tokens / wall_s if wall_s > 0 else 0
 
@@ -254,7 +256,7 @@ async def run_sweep(args):
                     "avg_tpot_ms":     round(float(np.mean(tpots)), 2),
                     "p50_tpot_ms":     round(float(np.percentile(tpots, 50)), 2),
                     "p99_tpot_ms":     round(float(np.percentile(tpots, 99)), 2),
-                    "avg_compute_ttft_ms": round(float(np.mean(ttfts)), 2),
+                    "avg_true_ttft_ms": round(float(np.mean(true_ttfts)), 2),
                     "total_tokens":    total_tokens,
                     "wall_clock_s":    round(wall_s, 2),
                     "throughput_tps":  round(throughput, 1),
@@ -262,9 +264,9 @@ async def run_sweep(args):
                 csv_rows.append(row)
 
                 log.info(
-                    "  → ok=%d  avg_tpot=%.1f  avg_ttft=%.1f  "
+                    "  → ok=%d  avg_tpot=%.1f  avg_true_ttft=%.1f  "
                     "throughput=%.1f tok/s  wall=%.1f s",
-                    len(valid), row["avg_tpot_ms"], row["avg_compute_ttft_ms"],
+                    len(valid), row["avg_tpot_ms"], row["avg_true_ttft_ms"],
                     throughput, wall_s,
                 )
 

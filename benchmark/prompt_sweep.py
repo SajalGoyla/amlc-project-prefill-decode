@@ -143,11 +143,11 @@ async def run_collocated_single(
                     if data.get("status") == "complete":
                         e2e_ms = (time.perf_counter() - t0) * 1000
                         return {
-                            "compute_ttft_ms": data["ttft_ms"],
-                            "tpot_ms":         data["tpot_ms"],
+                            "compute_ttft_ms": data.get("compute_ttft_ms", data.get("ttft_ms", 0)),
+                            "tpot_ms":         data.get("tpot_ms", 0),
                             "kv_transfer_ms":  0.0,
                             "cache_recon_ms":  0.0,
-                            "tokens":          data["tokens"],
+                            "tokens":          data.get("tokens", 0),
                             "e2e_ms":          round(e2e_ms, 2),
                         }
                     if data.get("status") == "error":

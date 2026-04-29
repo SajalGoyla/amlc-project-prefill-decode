@@ -80,6 +80,7 @@ class PrefillResponse(BaseModel):
     status: str
     num_layers_streamed: int
     prefill_time_ms: float
+    true_ttft_ms: float
 
 
 # ==============================================================================
@@ -271,6 +272,9 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
 
     t_forward_end = time.perf_counter()
     forward_time_ms = (t_forward_end - t_forward_start) * 1000
+    
+    # Calculate True TTFT (if created_at is provided, else just fallback to forward_time)
+    true_ttft_ms = (t_forward_end - kwargs.get("created_at", t_forward_start)) * 1000
 
     # =========================================================================
     # Extract past_key_values from model output
@@ -354,6 +358,7 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
         "num_prompt_tokens": int(input_ids.shape[1]),
         "last_token_id": int(input_ids[0, -1].item()),
         "forward_time_ms": forward_time_ms,
+        "true_ttft_ms": true_ttft_ms,
     }
     complete_data = pickle.dumps(complete_payload, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -379,6 +384,7 @@ def run_prefill(session_id: str, prompt: str, max_new_tokens: int) -> dict:
         "status": "prefill_complete",
         "num_layers_streamed": num_layers,
         "prefill_time_ms": round(total_time_ms, 2),
+        "true_ttft_ms": round(true_ttft_ms, 2),
     }
 
 
@@ -396,6 +402,7 @@ async def prefill_worker_loop():
         session_id = request_data["session_id"]
         prompt = request_data["prompt"]
         max_new_tokens = request_data["max_new_tokens"]
+        created_at = request_data["created_at"]
 
         try:
             logger.info("Processing queued prefill for session '%s'", session_id)
@@ -405,6 +412,7 @@ async def prefill_worker_loop():
                 session_id=session_id,
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
+                created_at=created_at,
             )
         except torch.cuda.OutOfMemoryError:
             logger.error("CUDA OOM during prefill for session '%s'", session_id)
@@ -478,6 +486,7 @@ async def prefill_endpoint(request: PrefillRequest):
         "session_id": request.session_id,
         "prompt": request.prompt,
         "max_new_tokens": request.max_new_tokens,
+        "created_at": time.perf_counter(),
     })
 
     logger.info("Enqueued session '%s'. Queue size: %d", request.session_id, prefill_queue.qsize())
@@ -488,6 +497,7 @@ async def prefill_endpoint(request: PrefillRequest):
         status="queued",
         num_layers_streamed=0,
         prefill_time_ms=0.0,
+        true_ttft_ms=0.0,
     )
 
 
