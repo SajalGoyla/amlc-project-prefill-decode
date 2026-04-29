@@ -185,6 +185,7 @@ def plot_tpot_vs_length(coloc_csv, disag_csv, outdir):
     ax.set_xlabel("Prompt Length (tokens)")
     ax.set_ylabel("TPOT (ms/token)")
     ax.set_title("TPOT Stability vs Prompt Length")
+    ax.set_ylim(bottom=60, top=70) # Set fixed y-axis to show stability
     ax.legend()
 
     path = os.path.join(outdir, "tpot_vs_length.png")
@@ -242,6 +243,7 @@ def plot_concurrency_tpot(coloc_csv, disag_csv, outdir):
     ax.set_xlabel("Concurrent Requests")
     ax.set_ylabel("Average TPOT (ms/token)")
     ax.set_title("TPOT Stability Under Concurrent Load")
+    ax.set_ylim(bottom=60, top=70) # Set fixed y-axis to show stability
     ax.legend()
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
