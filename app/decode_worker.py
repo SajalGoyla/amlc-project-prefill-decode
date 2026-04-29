@@ -342,8 +342,6 @@ def decode_worker_loop():
                 result["num_tokens_generated"],
                 result["decode_time_ms"],
             )
-            # Save to metrics store for the benchmark script to poll
-            metrics_store[sid] = result
         except torch.cuda.OutOfMemoryError:
             logger.error("CUDA OOM during decode for session '%s'", sid)
             torch.cuda.empty_cache()
