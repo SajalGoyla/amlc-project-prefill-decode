@@ -1,4 +1,4 @@
-# AMLIC Project: Prefill-Decode Disaggregated Inference Serving
+# AMLC Project: Prefill-Decode Disaggregated Inference Serving
 
 A distributed LLM inference system proving that disaggregating the **Prefill** and **Decode** phases across two physically separated GPU servers (connected via VPC Peering and ZeroMQ) prevents Long-Prompt Interference and radically secures generation TPOT (Time-Per-Output-Token) scale at the cost of upfront networking/serialization latency.
 
