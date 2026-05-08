@@ -1,179 +1,88 @@
-# AMLIC — Adaptive Multi-tier LLM Inference on Cloud
+# AMLC Project: Prefill-Decode Disaggregated Inference Serving
 
-> Columbia COMS 6998 (Cloud Computing) — Final Project
+A distributed LLM inference system proving that disaggregating the **Prefill** and **Decode** phases across two physically separated GPU servers (connected via VPC Peering and ZeroMQ) prevents Long-Prompt Interference and radically secures generation TPOT (Time-Per-Output-Token) scale at the cost of upfront networking/serialization latency.
 
-**Adaptive LLM Inference via Prefill/Decode Disaggregation on Heterogeneous GPUs**
+By bypassing standard frameworks and streaming raw PyTorch KV caches over a ZMQ TCP socket, we successfully served `meta-llama/Meta-Llama-3-8B-Instruct` across two GCP L4 VM instances connected over a custom VPC Peering fabric. The results demonstrate an ~80x improvement in True TTFT under load while keeping TPOT rock-solid.
 
-## Overview
+## 📁 Code Structure
 
-This project benchmarks **collocated** vs **disaggregated** (prefill/decode) LLM serving using [vLLM](https://github.com/vllm-project/vllm) with the [NIXL](https://github.com/ai-dynamo/nixl) connector over a Tailscale overlay network. The goal is to find the empirical **prompt-length crossover threshold N**, below which collocated serving is faster and above which disaggregated serving wins.
+- **`app/`**: Contains the core serving nodes.
+  - `collocated_baseline.py`: A unified single-GPU FastAPI worker performing both prefill and decode natively. Used to measure the baseline.
+  - `gateway.py`: A lightweight FastAPI gateway routing client requests asynchronously to the Prefill worker.
+  - `prefill_worker.py`: Runs the prompt prefill phase, extracts `past_key_values` from the forward pass, and streams them tensor-by-layer over ZMQ to the Decode worker.
+  - `decode_worker.py`: Maintains a ZMQ PULL socket, buffers incoming KV tensors, reconstructs the HuggingFace `DynamicCache`, and runs `.generate()`.
+- **`benchmark/`**: Analytics and load testing suite.
+  - Scripts including `compare_architectures.py`, `concurrency_sweep.py`, and `prompt_sweep.py` bombard the endpoints and calculate True TTFT, TPOT, network overhead, and end-to-end latencies.
+- **`infra/`**: Helper scripts (`setup_gcp.sh`, `setup_nat.sh`) necessary for automating the GCP and custom VPC peering architecture to guarantee 1ms RTT cross-node networking.
 
-### Architecture
+## ⚙️ Setup Instructions
 
-```
-┌─────────────────┐         ┌──────────────────────────────────┐
-│   User / Demo   │         │         Adaptive Router          │
-│   (Streamlit)   │────────▶│  token_count ≥ N? → disagg      │
-│                 │         │  token_count < N? → collocated   │
-└─────────────────┘         └──────────┬───────────┬───────────┘
-                                       │           │
-                            ┌──────────▼──┐   ┌────▼───────────────────────┐
-                            │ Collocated  │   │   Disaggregated Proxy     │
-                            │  vLLM (L4)  │   │   (FastAPI)               │
-                            │  Port 8000  │   │   Port 9000               │
-                            └─────────────┘   └────┬──────────┬───────────┘
-                                                   │          │
-                                          ┌────────▼──┐  ┌────▼────────┐
-                                          │  Prefill  │  │   Decode    │
-                                          │ vLLM (L4) │  │  vLLM (T4) │
-                                          │ Port 8100 │──│  Port 8200  │
-                                          │ KV Prod.  │  │  KV Cons.  │
-                                          └───────────┘  └────────────┘
-                                              NIXL/UCX over Tailscale
-```
+### Prerequisites
+- Two distinct GCP VMs with **NVIDIA L4 GPUs** (24GB VRAM each).
+- Both VMs must be connected via a peered VPC internal network (required to hit sub-millisecond / 1ms RTT).
+- Python 3.10+ environment.
+- A valid Hugging Face account token with access to `meta-llama/Meta-Llama-3-8B-Instruct`.
 
-### Hardware
-
-| Role | GPU | VRAM | VM Type | 
-|------|-----|------|---------|
-| Prefill + Collocated | NVIDIA L4 | 24 GB | GCP g2-standard-4 |
-| Decode | NVIDIA T4 | 16 GB | GCP n1-standard-4 + T4 |
-
-### Model
-
-- `meta-llama/Llama-3.2-3B-Instruct` (3B params, fits in 16 GB with room for KV cache)
-
-## Repository Structure
-
-```
-Project/
-├── .env.example           # Environment template
-├── pyproject.toml         # Python project config
-├── README.md              # This file
-│
-├── infra/                 # VM infrastructure scripts
-│   ├── vm_bootstrap.sh    # Idempotent VM setup
-│   ├── start_collocated.sh
-│   ├── start_prefill.sh
-│   ├── start_decode.sh
-│   └── proxy_server.py    # Disaggregated proxy
-│
-├── benchmark/             # Benchmarking framework
-│   ├── client.py          # Async OpenAI-compatible client
-│   ├── workloads.py       # Workload profiles + sweep
-│   ├── runner.py          # Benchmark orchestrator
-│   ├── prompts/           # Source text for prompt generation
-│   └── results/           # CSV results (gitignored, except .gitkeep)
-│
-├── analysis/              # Data analysis
-│   ├── compute_threshold.py  # Find crossover N
-│   ├── plot_results.py    # Generate plots
-│   └── figures/           # Output plots
-│
-├── router/                # Adaptive router
-│   └── router.py          # FastAPI router
-│
-├── demo/                  # Streamlit demo
-│   └── app.py             # Interactive chatbot + comparison
-│
-└── scripts/               # Helper scripts
-    ├── run_full_benchmark.sh
-    ├── health_check.sh
-    └── net_benchmark.sh
-```
-
-## Quick Start
-
-### 1. Setup (Laptop)
-
+### Installation
+Clone the repository and install requirements on **both** VMs:
 ```bash
-# Clone and install local dependencies
-cd Project/
+git clone <YOUR_REPOSITORY_URL> ~/amlc-project-prefill-decode
+cd ~/amlc-project-prefill-decode
+pip3 install -r requirements.txt
+```
+
+Configure your environment variables:
+```bash
 cp .env.example .env
-# Edit .env with your HF_TOKEN, VM IPs, etc.
-
-pip install -e ".[dev]"
+nano .env 
 ```
+*Crucial*: Ensure you set your `HF_TOKEN`. On the Prefill VM, `DECODE_WORKER_HOST` must be accurately configured to point to the internal VPC IP of the Decode VM.
 
-### 2. Setup (VMs)
+## 🚀 How to Run
 
+### Phase 1: Obtaining the Collocated Baseline
+1. **On your Decode VM**, launch the unified benchmarking baseline:
 ```bash
-# On each VM:
-scp -r infra/ user@VM_IP:~/amlic/
-ssh user@VM_IP
-cd ~/amlic
-bash infra/vm_bootstrap.sh
+python3 app/collocated_baseline.py
 ```
-
-### 3. Install Tailscale (both VMs)
-
+2. **On your Prefill VM**, run the benchmark client to bombard the baseline node:
 ```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-# Note the Tailscale IPs and update .env
+python3 benchmark/compare_architectures.py \
+   --concurrent 3 \
+   --collocated-url http://<DECODE_INTERNAL_IP>:8000 \
+   --skip-disaggregated
 ```
 
-### 4. Start Services
+### Phase 2: Launching the Dual-GPU Disaggregated Rig
+*Note: Ensure `collocated_baseline.py` is fully terminated (Ctrl+C) on the Decode VM before proceeding to avoid Out-Of-Memory crashes, as L4 GPUs are limited to 24GB VRAM.*
 
+1. **Start the Decode Worker (Decode VM)**
 ```bash
-# ON PREFILL VM (L4):
-bash infra/start_collocated.sh   # Collocated baseline
-bash infra/start_prefill.sh      # Prefill engine (in another tmux)
-python infra/proxy_server.py \
-    --prefiller-host $(tailscale ip -4) --prefiller-port 8100 \
-    --decoder-host <DECODE_TAILSCALE_IP> --decoder-port 8200
-
-# ON DECODE VM (T4):
-bash infra/start_decode.sh
+python3 app/decode_worker.py
 ```
 
-### 5. Run Benchmarks
-
+2. **Start the Prefill Engine Array (Prefill VM)**
+In Terminal 1 (Gateway):
 ```bash
-# ON LAPTOP:
-bash scripts/run_full_benchmark.sh 30 1
-# Or run individual profiles:
-python -m benchmark.runner --endpoint http://<IP>:8000/v1 --arch collocated --profile chat
+python3 app/gateway.py
 ```
-
-### 6. Analyze Results
-
+In Terminal 2 (Prefill Worker):
 ```bash
-python -m analysis.compute_threshold --results-dir benchmark/results/
-python -m analysis.plot_results --results-dir benchmark/results/
+python3 app/prefill_worker.py
 ```
 
-### 7. Launch Demo
-
+3. **Generate Final Metrics Overlay (Prefill VM)**
+Run the benchmarker isolating only the disaggregated logic:
 ```bash
-streamlit run demo/app.py
+python3 benchmark/compare_architectures.py \
+   --concurrent 3 \
+   --gateway-url http://localhost:8000 \
+   --decode-url http://<DECODE_INTERNAL_IP>:8002 \
+   --skip-collocated
 ```
 
-## Key Metrics
+## 📊 Key Results & Findings
 
-| Metric | Description |
-|--------|-------------|
-| **TTFT** | Time to first token (ms) — user-perceived responsiveness |
-| **ITL** | Inter-token latency (ms) — streaming smoothness |
-| **Throughput** | Output tokens per second |
-| **Total Latency** | End-to-end request latency (ms) |
-
-## Workload Profiles
-
-| Profile | Input Tokens | Output Tokens | Use Case |
-|---------|-------------|---------------|----------|
-| `chat` | 50 | 500 | Short prompt, long generation |
-| `doc_qa` | 2000 | 100 | Long document, short answer |
-| `balanced` | 500 | 200 | Medium both |
-| `sweep_N` | Variable | 100 | Prompt-length sweep for threshold |
-
-## Fallback Plan
-
-If NIXL/UCX over Tailscale proves unstable:
-1. Switch to **LMCacheConnector** (uses Redis for KV transfer)
-2. Install Redis on both VMs
-3. Update `kv_connector` in start scripts
-
-## License
-
-Academic project — Columbia University COMS 6998.
+- **Concurrent Load Resiliency**: Under a concurrent load of 10 requests, the collocated TTFT degrades to an unusable 37.5 seconds due to destructive prefill/decode interference. Conversely, the disaggregated system stays highly responsive at ~0.4 seconds, an **~80x latency improvement**.
+- **Stable TPOT**: Time-Per-Output-Token remains rock-solid at ~64ms across both architectures, validating that architectural decoupling does not harm generation speed.
+- **The Network/Serialization Tax**: Moving KV cache layers across a 1ms RTT VPC network utilizing Python Pickle serialization scales linearly from ~30ms at 50 prompt tokens to ~350ms at 2000 prompt tokens. While VPC peering minimized network constraints, standard tensor serialization formats still pose a substantial transfer overhead.

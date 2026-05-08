@@ -1,0 +1,64 @@
+{
+  "runs": [
+    {
+      "run": 1,
+      "session_id": "204346d6-0997-4d11-ba6c-59e2d950a529",
+      "ack_latency_ms": 37.28,
+      "e2e_latency_ms": 543.17,
+      "final_status": "prefill_accepted",
+      "prompt_length_chars": 83,
+      "max_new_tokens": 512
+    },
+    {
+      "run": 2,
+      "session_id": "3eb1e893-e2a5-456d-9540-f661a698b13c",
+      "ack_latency_ms": 37.77,
+      "e2e_latency_ms": 543.45,
+      "final_status": "prefill_accepted",
+      "prompt_length_chars": 83,
+      "max_new_tokens": 512
+    },
+    {
+      "run": 3,
+      "session_id": "ecf639f5-4e14-44dd-b502-89fa69d63a12",
+      "ack_latency_ms": 37.19,
+      "e2e_latency_ms": 542.66,
+      "final_status": "prefill_accepted",
+      "prompt_length_chars": 83,
+      "max_new_tokens": 512
+    },
+    {
+      "run": 4,
+      "session_id": "6af691f8-5300-46a7-ba53-bc966de76d2c",
+      "ack_latency_ms": 37.13,
+      "e2e_latency_ms": 542.7,
+      "final_status": "prefill_accepted",
+      "prompt_length_chars": 83,
+      "max_new_tokens": 512
+    },
+    {
+      "run": 5,
+      "session_id": "7e18fa44-cb2d-499f-adfe-33f37410c503",
+      "ack_latency_ms": 37.21,
+      "e2e_latency_ms": 542.73,
+      "final_status": "prefill_accepted",
+      "prompt_length_chars": 83,
+      "max_new_tokens": 512
+    }
+  ],
+  "summary": {
+    "num_runs": 5,
+    "num_successful": 5,
+    "ack_latency_ms": {
+      "min": 37.13,
+      "max": 37.77,
+      "avg": 37.32
+    },
+    "e2e_latency_ms": {
+      "min": 542.66,
+      "max": 543.45,
+      "avg": 542.94
+    },
+    "note": "TTFT and TPOT are measured on the Decode Worker side. Check decode_worker logs for precise per-token timing. E2E latency here measures Gateway round-trip only."
+  }
+}
